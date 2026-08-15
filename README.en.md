@@ -54,7 +54,6 @@ Use a GPT image model to generate a WeChat article cover.
 
 - Currently tested only in the DSH Web profile.
 - Images are kept in DSH process memory. Historical image links stop working after restart; save images you want to keep from the chat UI.
-- Image previews are available only from the local machine. They do not render when DSH Web is accessed through a LAN or remote connection.
 
 ## License
 

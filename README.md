@@ -56,7 +56,6 @@ dsh plugin --profile web add github:corrinehu/dsh-chat-imagine
 
 - 当前仅在 DSH Web profile 中测试通过。
 - 图片只保存在 DSH 进程内存中；重启后历史图片链接会失效。需要保留时请从聊天界面保存。
-- 图片预览只允许本机访问；通过局域网或远程打开 DSH Web 时，图片不会内联显示。
 
 ## 许可证
 
