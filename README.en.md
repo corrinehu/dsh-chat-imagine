@@ -40,7 +40,7 @@ Create a minimal illustration for a technical blog cover.
 
 The result appears in the chat.
 
-You can also generate through a non-default backend:
+You can also use another image backend:
 
 ![Choose a non-default backend](assets/3.png)
 

@@ -40,7 +40,7 @@ dsh plugin --profile web add github:corrinehu/dsh-chat-imagine
 
 生成结果会直接显示在聊天中。
 
-也可以其他渠道生图（非默认），比如：
+也可使用其他生图渠道，例如：
 
 
 ![选择非默认渠道](assets/3.png)
