@@ -1,0 +1,5 @@
+# dsh-chat-imagine bundle layer: register the plugin into the harness composition.
+# 安装态（dsh plugin add）按包名解析（package.json 的 main 指向 index.js）。
+- insert:
+    - id: dsh-chat-imagine
+      name: dsh-chat-imagine
