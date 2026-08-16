@@ -7,6 +7,7 @@
   "files": [
     "index.js",
     "cordis.patch.yml",
+    "skills",
     "assets",
     "README.md",
     "README.en.md"
