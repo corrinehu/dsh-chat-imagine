@@ -4,7 +4,7 @@
 
 插件实现了在 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的聊天窗口中自动调用已有的生图工具，生成图片并展示。
 
-![在 DSH 对话中生成的图片](assets/2.png)
+![在 DSH 对话中生成的图片](assets/1.png)
 
 ### 说明
 
@@ -31,7 +31,7 @@ dsh plugin --profile web add github:corrinehu/dsh-chat-imagine
 
 插件会检索可用的渠道和模型，并询问默认生图的渠道：
 
-![首次生成时选择默认渠道](assets/1.png)
+![首次生成时选择默认渠道](assets/2.png)
 
 设置后，不必重复选择。其后，直接在聊天里描述你想要的图片：
 

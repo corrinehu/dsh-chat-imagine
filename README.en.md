@@ -4,7 +4,7 @@ English | [中文](./README.md)
 
 Use image-generation tools already available to [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) directly from the chat, then display the generated image in the conversation.
 
-![An image generated in a DSH conversation](assets/2.png)
+![An image generated in a DSH conversation](assets/1.png)
 
 ### Overview
 
@@ -31,7 +31,7 @@ Create a cute blue whale logo.
 
 The plugin checks available channels and models, then asks which one to use as the default:
 
-![Choose a default image backend](assets/1.png)
+![Choose a default image backend](assets/2.png)
 
 Once you set a default, later requests can go straight to generation:
 
