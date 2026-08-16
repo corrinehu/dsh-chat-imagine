@@ -1,6 +1,7 @@
-import { mkdir, readFile, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, readFile, readdir, stat } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
@@ -55,16 +56,20 @@ function renderBackendReport(value) {
   const lines = []
   if (channels.length === 0) {
     lines.push('✅ 生图渠道探测完成：本机暂未发现可用的生图渠道。')
-    lines.push('提示：可安装 mmx CLI（MiniMax），或在「设置→模型」里配置一个 OpenAI 兼容渠道并包含生图模型（如 openrouter）后再试。')
+    lines.push('提示：可安装 mmx CLI（MiniMax）或 codex CLI（OpenAI Codex，需已登录 ChatGPT 账号），或在「设置→模型」里配置一个 OpenAI 兼容渠道并包含生图模型（如 openrouter）后再试。')
   } else {
     lines.push('✅ 生图渠道探测完成，以下渠道可用：')
     for (const ch of channels) {
       const models = (ch.models ?? []).map((m) => m.id).join(' / ')
-      lines.push(`- ${ch.id}（${ch.kind === 'cli' ? '本机 CLI' : 'API 网关'}）：${models}`)
+      const label = ch.kind === 'cli' ? `本机 CLI${ch.note ? `·${ch.note}` : ''}` : 'API 网关'
+      lines.push(`- ${ch.id}（${label}）：${models}`)
     }
     lines.push('')
     lines.push(`当前默认：渠道 ${defaultBackend || '未设置'}，模型 ${defaultModel || '未设置'}`)
     lines.push('你可以：① 告诉我用哪个渠道/模型作为默认；② 先测试某个渠道或模型是否可用（个别模型可能不被网关支持），确认后再设默认。')
+    if (channels.some((ch) => ch.kind === 'cli' && ch.id !== 'mmx')) {
+      lines.push('说明：codex / agy 是「CLI 套壳」渠道——把提示词交给本机已登录的 codex（ChatGPT 账号）或 agy（Google 账号）CLI，用其内置生图工具出图，消耗对应账号额度而非 API key。对调用方完全透明：prompt 照常写画面描述即可，不需要任何命令行知识，插件内部会负责调用与取回图片。API 渠道没额度时它们是现成的备用。')
+    }
   }
   lines.push('')
   lines.push('结构化结果（供精确调用）：')
@@ -83,6 +88,8 @@ export const Config = Schema.object({
   defaultBackend: Schema.string().default(''),
   defaultModel: Schema.string().default(''),
   mmxBin: Schema.string().default('mmx'),
+  codexBin: Schema.string().default('codex'),
+  agyBin: Schema.string().default('agy'),
   displayHost: Schema.string().default(''),
   routePath: Schema.string().default('/chat-imagine'),
   timeoutMs: Schema.number().default(120000),
@@ -200,28 +207,33 @@ export function apply(ctx, config) {
 
   // 服务在调用时惰性获取（apply 阶段 tools/webServer 先就绪，
   // shell/settings/credentials 可能稍后才提供，不能一次性捕获）。
+  // 共享 shell 封装：resolve 成完整 spec（先试全权限，失败退回默认策略）后执行，
+  // 返回 { code, out, err }；探测与 CLI 渠道生成共用。
+  // ⚠️ 沙箱请求的 key 是 sandboxPolicy（不是 policy）：shell 服务的 resolve 只读
+  // request.sandboxPolicy，传错 key 会被静默忽略并回退到部署级默认沙箱（受限
+  // seatbelt）——codex/agy 的进程初始化（symlink/IPC socket）会因此 EPERM。
+  async function shellOnce(shell, cmd, timeoutMs) {
+    try {
+      let spec
+      try {
+        spec = shell.resolve({ command: cmd, ...(timeoutMs ? { timeoutMs } : {}), sandboxPolicy: { mode: 'danger-full-access' } })
+      } catch {
+        spec = shell.resolve({ command: cmd, ...(timeoutMs ? { timeoutMs } : {}) })
+      }
+      const run = await shell.run(spec)
+      return { code: run.exitCode, out: (run.stdout?.text ?? '').trim(), err: (run.stderr?.text ?? '').trim() }
+    } catch (e) {
+      return { code: -1, out: '', err: String(e) }
+    }
+  }
+
   async function probeMmx(debug) {
     const shell = ctx.get('shell')
     if (!shell) {
       if (debug) debug.shell = 'unavailable'
       return null
     }
-    const runCmd = async (cmd) => {
-      try {
-        // 真实 shell 服务要求先 resolve 成完整 spec（含沙箱策略），
-        // 插件内部执行需要全权限（mmx 需要 exec + 网络 + 临时目录写）。
-        let spec
-        try {
-          spec = shell.resolve({ command: cmd, policy: { mode: 'danger-full-access' } })
-        } catch {
-          spec = shell.resolve({ command: cmd })
-        }
-        const run = await shell.run(spec)
-        return { code: run.exitCode, out: (run.stdout?.text ?? '').trim(), err: (run.stderr?.text ?? '').trim() }
-      } catch (e) {
-        return { code: -1, out: '', err: String(e) }
-      }
-    }
+    const runCmd = (cmd) => shellOnce(shell, cmd)
     // 候选：裸命令名 + 常见安装位置（shell 环境 PATH/HOME 可能不全，用 os.homedir()）
     const home = homedir()
     const candidates = [
@@ -240,6 +252,7 @@ export function apply(ctx, config) {
           kind: 'cli',
           name: 'mmx CLI (MiniMax)',
           bin: c,
+          note: '走 MiniMax 账号',
           models: [{ id: 'image-01', name: 'MiniMax image-01' }],
         }
       }
@@ -253,6 +266,7 @@ export function apply(ctx, config) {
         kind: 'cli',
         name: 'mmx CLI (MiniMax)',
         bin: r.out,
+        note: '走 MiniMax 账号',
         models: [{ id: 'image-01', name: 'MiniMax image-01' }],
       }
     }
@@ -264,6 +278,153 @@ export function apply(ctx, config) {
   async function mmxChannel() {
     if (mmxCache === undefined) mmxCache = await probeMmx(null)
     return mmxCache
+  }
+
+  // ── codex CLI 渠道（与 mmx 同类的本机 CLI 渠道）──────────
+  // codex 内置的 image_gen 是 hosted 工具：跑在 codex 自己的 agent 循环里，
+  // 消耗用户 ChatGPT 账号（Plus/Pro）的额度，而非 API key。探测只看二进制
+  // 是否存在；登录态/额度是否可用在生成时才暴露（与 mmx 的行为一致）。
+  async function probeCodex(debug) {
+    const shell = ctx.get('shell')
+    if (!shell) {
+      if (debug) debug.shell = 'unavailable'
+      return null
+    }
+    const home = homedir()
+    const candidates = [
+      config.codexBin,
+      home ? `${home}/.local/bin/${config.codexBin}` : '',
+      `/opt/homebrew/bin/${config.codexBin}`,
+      `/usr/local/bin/${config.codexBin}`,
+    ].filter(Boolean)
+    if (debug) debug.candidates = candidates
+    for (const c of candidates) {
+      const r = await shellOnce(shell, `test -x ${JSON.stringify(c)} && echo FOUND || echo NO`)
+      if (r.code === 0 && r.out.includes('FOUND')) {
+        if (debug) debug.found = c
+        return {
+          id: 'codex',
+          kind: 'cli',
+          name: 'codex CLI (ChatGPT)',
+          bin: c,
+          note: '走 ChatGPT 账号额度',
+          models: [{ id: 'image-gen', name: 'codex 内置 image_gen' }],
+        }
+      }
+    }
+    // 兜底：command -v
+    const r = await shellOnce(shell, `command -v ${config.codexBin}`)
+    if (debug) debug.commandV = r
+    if (r.code === 0 && r.out) {
+      return {
+        id: 'codex',
+        kind: 'cli',
+        name: 'codex CLI (ChatGPT)',
+        bin: r.out,
+        note: '走 ChatGPT 账号额度',
+        models: [{ id: 'image-gen', name: 'codex 内置 image_gen' }],
+      }
+    }
+    return null
+  }
+
+  // 进程内缓存 codex 探测结果
+  let codexCache
+  async function codexChannel() {
+    if (codexCache === undefined) codexCache = await probeCodex(null)
+    return codexCache
+  }
+
+  // ── agy CLI 渠道（Google Antigravity，第三个本机 CLI 渠道）──────────
+  // agy 的图像生成是其 agent 循环里的内置 Gemini 图像工具（App 里的
+  // "Gemini 3.1 Flash Image"），消耗 Google 账号额度。探测只看二进制；
+  // 登录态/额度在生成时才暴露（与 mmx/codex 的行为一致）。
+  async function probeAgy(debug) {
+    const shell = ctx.get('shell')
+    if (!shell) {
+      if (debug) debug.shell = 'unavailable'
+      return null
+    }
+    const home = homedir()
+    const candidates = [
+      config.agyBin,
+      home ? `${home}/.local/bin/${config.agyBin}` : '',
+      `/opt/homebrew/bin/${config.agyBin}`,
+      `/usr/local/bin/${config.agyBin}`,
+    ].filter(Boolean)
+    if (debug) debug.candidates = candidates
+    for (const c of candidates) {
+      const r = await shellOnce(shell, `test -x ${JSON.stringify(c)} && echo FOUND || echo NO`)
+      if (r.code === 0 && r.out.includes('FOUND')) {
+        if (debug) debug.found = c
+        return {
+          id: 'agy',
+          kind: 'cli',
+          name: 'agy CLI (Google Antigravity)',
+          bin: c,
+          note: '走 Google 账号额度',
+          models: [
+            { id: 'gemini-3.7-flash-low', name: 'Gemini 3.7 Flash (Low) · 默认' },
+            { id: 'gemini-3.7-flash-medium', name: 'Gemini 3.7 Flash (Medium)' },
+            { id: 'gemini-3.7-flash-high', name: 'Gemini 3.7 Flash (High)' },
+          ],
+        }
+      }
+    }
+    const r = await shellOnce(shell, `command -v ${config.agyBin}`)
+    if (debug) debug.commandV = r
+    if (r.code === 0 && r.out) {
+      return {
+        id: 'agy',
+        kind: 'cli',
+        name: 'agy CLI (Google Antigravity)',
+        bin: r.out,
+        note: '走 Google 账号额度',
+        models: [
+          { id: 'gemini-3.7-flash-low', name: 'Gemini 3.7 Flash (Low) · 默认' },
+          { id: 'gemini-3.7-flash-medium', name: 'Gemini 3.7 Flash (Medium)' },
+          { id: 'gemini-3.7-flash-high', name: 'Gemini 3.7 Flash (High)' },
+        ],
+      }
+    }
+    return null
+  }
+
+  // 进程内缓存 agy 探测结果
+  let agyCache
+  async function agyChannel() {
+    if (agyCache === undefined) agyCache = await probeAgy(null)
+    return agyCache
+  }
+
+  // 递归扫描 root 下的位图文件（png/jpg/webp），收集 mtime 晚于 startMs 的，
+  // 返回 [{ path, mtime }]（CLI 回复里解析不到路径时的兜底；对 SVG 不感兴趣——
+  // CLI 的 agent 有时会手写 SVG 交差，那不是 AI 生图）。
+  async function scanImagesSince(root, startMs) {
+    const out = []
+    const walk = async (dir) => {
+      let entries
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const e of entries) {
+        const p = join(dir, e.name)
+        if (e.isDirectory()) await walk(p)
+        else if (e.isFile() && /\.(png|jpe?g|webp)$/i.test(e.name)) {
+          try {
+            const st = await stat(p)
+            // CLI 落盘与本地 stat 之间可能有时钟偏移：放宽 2 秒
+            if (st.mtimeMs >= startMs - 2000) out.push({ path: p, mtime: st.mtimeMs })
+          } catch {
+            // 单个文件 stat 失败：跳过
+          }
+        }
+      }
+    }
+    await walk(root)
+    return out
   }
 
   async function probeApiChannels() {
@@ -318,14 +479,56 @@ export function apply(ctx, config) {
   async function listBackends() {
     const debug = {}
     const mmx = await probeMmx(debug)
+    const codex = await codexChannel()
+    const agy = await agyChannel()
     const apis = await probeApiChannels()
-    return { channels: [mmx, ...apis].filter(Boolean), debug }
+    return { channels: [mmx, codex, agy, ...apis].filter(Boolean), debug }
   }
+
+  // ── 随插件注册的技能：codex/agy 手动生图操作手册 ──────────
+  // 本体是 skills/cli-image-gen/SKILL.md（与独立安装到 codex 等宿主的同一份）。
+  // 与 modlens 的「拷贝安装 skill」不同，这里用 ctx.skills.register() 程序化
+  // 注册：随插件分发、升级自动更新、停用自动摘除，不存在 stale copy。
+  // 仅在探测到 codex 或 agy CLI 时注册（没装的机器上完全不出现）。
+  // skills 服务是可选增强（工具路径不依赖它），拿不到就静默跳过。
+  const SKILL_NAME = 'cli-image-gen'
+  let skillRegistered = false
+  async function registerCliSkill() {
+    if (skillRegistered) return
+    const [codex, agy] = await Promise.all([codexChannel(), agyChannel()])
+    if (!codex && !agy) return
+    const skills = ctx.get('skills')
+    if (!skills || typeof skills.register !== 'function') return
+    try {
+      const skillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills', 'cli-image-gen')
+      const raw = await readFile(join(skillDir, 'SKILL.md'), 'utf8')
+      // 剥掉 YAML frontmatter 取正文；把 <skill-dir> 占位符重写为真实绝对路径，
+      // 让正文里的 gen.sh 调用在本会话直接可执行
+      const body = raw.replace(/^---\n[\s\S]*?\n---\n/, '').replace(/^\s+/, '').replaceAll('<skill-dir>', skillDir)
+      const dispose = skills.register({
+        name: SKILL_NAME,
+        // 程序化注册必须显式声明来源：加载路径（validateDefinition）强制要求
+        // source 为字符串，缺失会抛 "source must be a string"；runtime 是专门
+        // 给程序化注册的取值。
+        source: 'runtime',
+        description: 'Manually drive the locally installed codex (ChatGPT quota) or agy (Google quota) CLI to generate real AI bitmap images (PNG/JPG) headlessly, then display them in chat via show_image_file. Use when the generate_image tool fails on the codex/agy backend (quota exhausted, region blocked, output parsing failed) and manual recovery is needed, for batch image generation (the tool is one-image-per-call), when the user explicitly asks to drive the CLI directly, or when the user mentions codex/agy/antigravity as the image source (用 codex 画图 / 用 agy 生成 / 走谷歌额度 / 走 ChatGPT 额度). For a single image, prefer calling the generate_image tool directly first — it wraps the same CLIs in one call.',
+        whenToUse: 'generate_image 工具在 codex/agy 渠道失败后的手动恢复路径；批量生图；用户点名 codex/agy/账号额度渠道',
+        content: body,
+      })
+      skillRegistered = true
+      // register() 内部经 layers.effect 绑定到本插件 ctx，停用/升级自动摘除；
+      // 这里只持有 disposer 引用防止被提前回收，无需手动调用。
+      void dispose
+    } catch {
+      // 技能文件缺失或注册失败：工具路径不受影响，静默降级
+    }
+  }
+  registerCliSkill()
 
   // ── 工具：列出可用生图渠道 ───────────────────────────────
   ctx.tools.register(defineTool({
     name: 'list_image_backends',
-    description: 'Probe and list the image-generation channels available on this machine: local CLIs (e.g. mmx) and OpenAI-compatible API gateways configured under Model settings (e.g. openrouter). Call this before generating when the user asks which channels/models are available, or when generate_image needs an explicit backend. Relay the rendered report to the user and ask which channel/model to use or to test.',
+    description: 'Probe and list the image-generation channels available on this machine: local CLIs (mmx = MiniMax account, codex = ChatGPT account, agy = Google account) and OpenAI-compatible API gateways configured under Model settings (e.g. openrouter). Call this before generating when the user asks which channels/models are available, or when generate_image needs an explicit backend. Relay the rendered report to the user and ask which channel/model to use or to test.',
     parameters: {},
     output: {
       schema: {
@@ -348,12 +551,12 @@ export function apply(ctx, config) {
   // ── 工具：生图（支持显式 backend/model）──────────────────
   ctx.tools.register(defineTool({
     name: 'generate_image',
-    description: 'Generate an image through a chosen channel and return a markdown image reference for inline display in the chat. The returned value contains a markdown image reference ![alt](url) — you MUST include that markdown line VERBATIM in your reply text so the image renders inline; do not paste a bare link, do not call other tools to "display" it, and do not regenerate. Available channels come from list_image_backends (e.g. "mmx", "openrouter"). HARD GATE: if no default channel has been configured yet, this tool REFUSES to generate and returns a guidance report instead — even if you pass backend explicitly. In that case you MUST relay the channel list to the user and let THEM pick the default (never choose one yourself), persist their choice with set_image_default, then retry. The gate fires only until a default exists.',
+    description: 'Generate an image through a chosen channel and return a markdown image reference for inline display in the chat. The returned value contains a markdown image reference ![alt](url) — you MUST include that markdown line VERBATIM in your reply text so the image renders inline; do not paste a bare link, do not call other tools to "display" it, and do not regenerate. Available channels come from list_image_backends (e.g. "mmx", "codex", "agy", "openrouter"). CLI channels (mmx/codex/agy) are transparent wrappers around locally installed CLIs — you still just pass prompt/backend/model exactly like an API channel; the plugin handles the CLI invocation and file retrieval internally, so NEVER run codex/agy/mmx commands yourself via bash. codex spends ChatGPT account quota, agy spends Google account quota, and both are natural fallbacks when API channels are out of quota. HARD GATE: if no default channel has been configured yet, this tool REFUSES to generate and returns a guidance report instead — even if you pass backend explicitly. In that case you MUST relay the channel list to the user and let THEM pick the default (never choose one yourself), persist their choice with set_image_default, then retry. The gate fires only until a default exists.',
     parameters: {
       prompt: { type: 'string', required: true, description: 'Image description / prompt (English usually works best).' },
-      backend: { type: 'string', description: 'Optional channel id, e.g. "mmx" or "openrouter". Pass it whenever the user names a specific channel — it overrides the configured default. Omit to use the default.' },
-      model: { type: 'string', description: 'Optional model id for the backend, e.g. "image-01" (mmx) or "gpt-image-2" (openrouter). Omit to use the channel default. Note: the configured default model only applies to the configured default channel.' },
-      size: { type: 'string', description: 'Optional image size, e.g. 1024x1024 (api) or 16:9 (mmx). Omit to use each backend\'s own default.' },
+      backend: { type: 'string', description: 'Optional channel id, e.g. "mmx", "codex", "agy" or "openrouter". Pass it whenever the user names a specific channel — it overrides the configured default. Omit to use the default.' },
+      model: { type: 'string', description: 'Optional model id for the backend, e.g. "image-01" (mmx), "image-gen" (codex), "gemini-3.7-flash-low" (agy) or "gpt-image-2" (openrouter). Omit to use the channel default. Note: the configured default model only applies to the configured default channel.' },
+      size: { type: 'string', description: 'Optional image size, e.g. 1024x1024 (api) or 16:9 (mmx/codex/agy). Omit to use each backend\'s own default.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     async execute(args, exec) {
@@ -373,7 +576,7 @@ export function apply(ctx, config) {
         // 空清单是死胡同：没有可选的默认，引导话术必须换成「如何配置渠道」，
         // 否则模型会在「询问用户选默认 ↔ 无可选」之间空转。
         if (channels.length === 0) {
-          return `（❌ 本机未探测到任何可用的生图渠道，本次未生成图片。\n请把下面两种解决方式告诉用户（二选一），等用户配置完成后再重新探测确认：\n① 安装 mmx CLI（MiniMax）——装好后本插件会自动发现它；\n② 在 DSH「设置→模型」里添加一个 OpenAI 兼容渠道，并确保其模型列表里有生图模型（模型名含 image/imagen，例如 openrouter 上的 gpt-image / gemini 系列）。\n注意：现在调用 set_image_default 一定会失败（没有可选渠道），也不要原地重试 generate_image；等用户说配置好了，先调 list_image_backends 确认非空，再走询问默认的流程。）`
+          return `（❌ 本机未探测到任何可用的生图渠道，本次未生成图片。\n请把下面几种解决方式告诉用户（任选其一），等用户配置完成后再重新探测确认：\n① 安装 mmx CLI（MiniMax）——装好后本插件会自动发现它；\n② 安装 codex CLI（OpenAI Codex）并确保已登录有生图额度的 ChatGPT 账号（codex login status 可查）——装好后同样自动发现；\n③ 安装 agy CLI（Google Antigravity）并确保已登录有额度的 Google 账号——装好后同样自动发现；\n④ 在 DSH「设置→模型」里添加一个 OpenAI 兼容渠道，并确保其模型列表里有生图模型（模型名含 image/imagen，例如 openrouter 上的 gpt-image / gemini 系列）。\n注意：现在调用 set_image_default 一定会失败（没有可选渠道），也不要原地重试 generate_image；等用户说配置好了，先调 list_image_backends 确认非空，再走询问默认的流程。）`
         }
         const report = renderBackendReport({ channels, defaultBackend: '', defaultModel: '' })
         const explicit = String(args.backend ?? '').trim()
@@ -423,7 +626,7 @@ export function apply(ctx, config) {
         const cmd = `${bin} image generate --prompt ${JSON.stringify(prompt)}${sizeFlags} --out-dir ${JSON.stringify(dir)} --non-interactive --quiet`
         let spec
         try {
-          spec = shell.resolve({ command: cmd, timeoutMs: config.timeoutMs, policy: { mode: 'danger-full-access' } })
+          spec = shell.resolve({ command: cmd, timeoutMs: config.timeoutMs, sandboxPolicy: { mode: 'danger-full-access' } })
         } catch {
           spec = shell.resolve({ command: cmd, timeoutMs: config.timeoutMs })
         }
@@ -440,6 +643,129 @@ export function apply(ctx, config) {
         const bytes = await readFile(abs)
         const id = remember(bytes, MIME_BY_EXT[ext] ?? 'image/jpeg')
         return `${markdownFor(id, '生成的图片')}\n\n（渠道 ${backend}，模型 ${model || file}。⚠️ 展示方式：必须把上面这行 markdown 图片引用【原样复制进你的回复文本】（保持 ![...](...) 格式，不要改成纯链接、不要另调 show_image_file/read_image、不要重新生成），图片才会内联显示在聊天中。）`
+      }
+
+      // ── CLI 渠道（codex）─────────────────────────────────
+      // 套壳 codex exec：让 codex 自己的 agent 循环调用内置 image_gen（hosted 工具，
+      // 消耗 ChatGPT 账号额度），再从其输出中解析图片的落盘路径。
+      if (!section && backend === 'codex') {
+        const channel = await codexChannel()
+        if (!channel) {
+          throw new Error('generate_image: codex CLI not found on this machine. Run list_image_backends to see available channels.')
+        }
+        const shell = ctx.get('shell')
+        if (!shell) throw new Error('generate_image: shell service unavailable for the CLI backend')
+        const bin = channel.bin || config.codexBin
+        // codex 的 image_gen 不吃尺寸参数：把比例/像素转成自然语言约束拼进提示词
+        const sizeRaw = String(args.size ?? '').trim()
+        let sizeHint = ''
+        if (/^\d+:\d+$/.test(sizeRaw)) sizeHint = `，画面比例 ${sizeRaw}`
+        else if (/^\d+x\d+$/.test(sizeRaw)) sizeHint = `，画面尺寸约 ${sizeRaw} 像素`
+        const startMs = Date.now()
+        const instr = `请用内置的图片生成工具（image generation / image_gen）生成一张图片：${prompt}${sizeHint}。生成完成后，在回复里给出图片的完整绝对保存路径（~/.codex/generated_images/ 下的 .png/.jpg/.webp 文件）。除此之外不要做任何其他事情。`
+        // 单引号包裹（比双引号安全：$ 与反引号不会被 shell 展开）
+        const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+        // 强制 low 推理：生图不需要长思维链，省时间也省账号额度
+        const cmd = `${bin} exec --skip-git-repo-check -c 'model_reasoning_effort="low"' ${shq(instr)}`
+        // codex 跑的是完整 agent 循环（读提示→调工具→落盘），比单次 API 请求慢：
+        // 至少给 5 分钟
+        const cliTimeout = Math.max(config.timeoutMs, 300000)
+        const run = await shellOnce(shell, cmd, cliTimeout)
+        const output = `${run.out}\n${run.err}`
+        // 路径解析：优先解析 codex 回复里报告的绝对路径（可能被反引号/括号包裹）；
+        // 解析不到再按 mtime 扫描 generated_images 兜底。
+        const re = /([^\s'"`（）()]*generated_images\/[^\s'"`（）()]*\.(?:png|jpe?g|webp))/gi
+        const candidates = []
+        for (const m of output.matchAll(re)) {
+          const p = m[1].replace(/^~/, homedir())
+          try {
+            const st = await stat(p)
+            if (st.isFile()) candidates.push({ path: p, mtime: st.mtimeMs })
+          } catch {
+            // 输出里的路径不存在（如示例路径）：跳过
+          }
+        }
+        if (candidates.length === 0) candidates.push(...await scanImagesSince(join(homedir(), '.codex', 'generated_images'), startMs))
+        if (candidates.length === 0) {
+          const tail = output.trim().slice(-600) || '(无输出)'
+          const codeNote = run.code !== 0 ? ` (exit ${run.code})` : ''
+          // 权限特征识别：codex 的 app-server/IPC 初始化在受限环境下常报
+          // Operation not permitted (os error 1)——这不是登录/额度问题，而是
+          // 沙箱/权限把 CLI 的进程初始化挡了，需提示用户换手动路径或放宽权限。
+          const permHit = /operation not permitted|os error 1|\bEPERM\b|app-server|appserver|initialize.*failed/i.test(output)
+          const cause = permHit
+            ? '疑似权限限制：CLI 的进程初始化（app-server/IPC）被当前沙箱/权限模式拒绝（Operation not permitted），并非登录或额度问题'
+            : '常见原因：未登录 ChatGPT 账号或生图额度用尽——可让用户运行 codex login status 检查'
+          throw new Error(`generate_image: codex 未产出图片${codeNote}。${cause}。输出尾部：${tail}\n建议：① 让用户检查会话权限模式是否限制本机 CLI 执行；② 加载技能 ${SKILL_NAME}，按其中 codex 渠道指引直接驱动 CLI 并用 show_image_file 展示（模型手动的 bash 路径通常不受此限制）。`)
+        }
+        candidates.sort((a, b) => b.mtime - a.mtime)
+        const abs = candidates[0].path
+        const dot = abs.lastIndexOf('.')
+        const ext = (dot >= 0 ? abs.slice(dot) : '').toLowerCase()
+        const bytes = await readFile(abs)
+        const id = remember(bytes, MIME_BY_EXT[ext] ?? 'image/png')
+        return `${markdownFor(id, '生成的图片')}\n\n（渠道 ${backend}，模型 ${model || 'image-gen'}——codex 内置 image_gen，消耗 ChatGPT 账号额度。⚠️ 展示方式：必须把上面这行 markdown 图片引用【原样复制进你的回复文本】（保持 ![...](...) 格式，不要改成纯链接、不要另调 show_image_file/read_image、不要重新生成），图片才会内联显示在聊天中。）`
+      }
+
+      // ── CLI 渠道（agy）──────────────────────────────────
+      // 套壳 agy --print：让 agy 的 agent 循环调用内置 Gemini 图像工具（消耗
+      // Google 账号额度）。注意 agy 的 flag 必须用 --key=value 语法——空格分隔
+      // 会被它错误解析导致提示词碎片化（实测行为）。
+      if (!section && backend === 'agy') {
+        const channel = await agyChannel()
+        if (!channel) {
+          throw new Error('generate_image: agy CLI not found on this machine. Run list_image_backends to see available channels.')
+        }
+        const shell = ctx.get('shell')
+        if (!shell) throw new Error('generate_image: shell service unavailable for the CLI backend')
+        const bin = channel.bin || config.agyBin
+        const sizeRaw = String(args.size ?? '').trim()
+        let sizeHint = ''
+        if (/^\d+:\d+$/.test(sizeRaw)) sizeHint = `, aspect ratio ${sizeRaw}`
+        else if (/^\d+x\d+$/.test(sizeRaw)) sizeHint = `, roughly ${sizeRaw} pixels`
+        const startMs = Date.now()
+        const instr = `Use your built-in image generation tool (the Gemini image generation capability, NOT hand-written SVG or drawing code) to generate a PNG image: ${prompt}${sizeHint}. Then reply with the absolute file path of the saved PNG.`
+        const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+        // 模型 id 白名单校验：它会直接拼进命令行（= 语法），只放行安全字符
+        const modelId = String(model || 'gemini-3.7-flash-low')
+        if (!/^[A-Za-z0-9._-]+$/.test(modelId)) {
+          throw new Error(`generate_image: invalid agy model id "${modelId}"`)
+        }
+        // agy 跑的是完整 agent 循环，至少给 5 分钟；在临时目录里跑，避免在
+        // 当前工作区留下会话文件。
+        // --dangerously-skip-permissions：agy 的内部 agent（jetski）在 headless
+        // 模式下无法弹权限询问，跑命令类工具会被自动拒绝（"a tool required the
+        // command permission that headless mode cannot prompt for"）；生图场景
+        // 没有需要人工确认的操作，直接放行。
+        const cmd = `cd "$(mktemp -d)" && ${bin} --print --output-format=stream-json --model=${modelId} --dangerously-skip-permissions --prompt=${shq(instr)}`
+        const cliTimeout = Math.max(config.timeoutMs, 300000)
+        const run = await shellOnce(shell, cmd, cliTimeout)
+        const output = `${run.out}\n${run.err}`
+        // 路径解析：优先解析回复里的绝对路径（antigravity-cli/brain/<uuid>/xx.png）；
+        // 解析不到再按 mtime 扫描 brain 目录兜底。
+        const re = /([^\s'"`（）()]*antigravity-cli\/brain\/[^\s'"`（）()]*\.(?:png|jpe?g|webp))/gi
+        const candidates = []
+        for (const m of output.matchAll(re)) {
+          try {
+            const st = await stat(m[1])
+            if (st.isFile()) candidates.push({ path: m[1], mtime: st.mtimeMs })
+          } catch {
+            // 输出里的路径不存在：跳过
+          }
+        }
+        if (candidates.length === 0) candidates.push(...await scanImagesSince(join(homedir(), '.gemini', 'antigravity-cli', 'brain'), startMs))
+        if (candidates.length === 0) {
+          const tail = output.trim().slice(-600) || '(无输出)'
+          const codeNote = run.code !== 0 ? ` (exit ${run.code})` : ''
+          throw new Error(`generate_image: agy 未产出图片${codeNote}。常见原因：未登录 Google 账号、额度用尽或出口区域被拒（User location is not supported，需换代理节点）——可让用户在 Antigravity App 里确认登录状态。输出尾部：${tail}\n手动恢复：加载技能 ${SKILL_NAME}，按其中 agy 渠道指引直接驱动 CLI 并用 show_image_file 展示。`)
+        }
+        candidates.sort((a, b) => b.mtime - a.mtime)
+        const abs = candidates[0].path
+        const dot = abs.lastIndexOf('.')
+        const ext = (dot >= 0 ? abs.slice(dot) : '').toLowerCase()
+        const bytes = await readFile(abs)
+        const id = remember(bytes, MIME_BY_EXT[ext] ?? 'image/png')
+        return `${markdownFor(id, '生成的图片')}\n\n（渠道 ${backend}，模型 ${modelId}——agy 内置 Gemini 图像工具，消耗 Google 账号额度。⚠️ 展示方式：必须把上面这行 markdown 图片引用【原样复制进你的回复文本】（保持 ![...](...) 格式，不要改成纯链接、不要另调 show_image_file/read_image、不要重新生成），图片才会内联显示在聊天中。）`
       }
 
       // ── API 渠道 ────────────────────────────────────────
@@ -540,8 +866,8 @@ export function apply(ctx, config) {
     name: 'set_image_default',
     description: 'Set the default image-generation channel and model. The choice is persisted (survives restarts) and used by generate_image whenever backend/model are omitted. REQUIRED before the first generate_image call: generate_image refuses to generate until a default exists. Always call it with the channel the USER picked (from list_image_backends or from their own words), never your own preference; also use it to change the default later.',
     parameters: {
-      backend: { type: 'string', required: true, description: 'Channel id to use as default, e.g. "mmx" or "openrouter".' },
-      model: { type: 'string', description: 'Optional model id to pin as default, e.g. "image-01" or "gpt-image-2". Omit to clear the pinned model (channel default applies).' },
+      backend: { type: 'string', required: true, description: 'Channel id to use as default, e.g. "mmx", "codex", "agy" or "openrouter".' },
+      model: { type: 'string', description: 'Optional model id to pin as default, e.g. "image-01" (mmx), "image-gen" (codex) or "gpt-image-2". Omit to clear the pinned model (channel default applies).' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     async execute(args, exec) {
