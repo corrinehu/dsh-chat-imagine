@@ -1,0 +1,4 @@
+interface:
+  display_name: "CLI Image Gen"
+  short_description: "用 codex / agy 账号额度无头生成 AI 位图图片"
+  default_prompt: "Use $cli-image-gen to generate an image via the codex or agy CLI (account quota, no API key)."
