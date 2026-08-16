@@ -15,6 +15,38 @@ const MIME_BY_EXT = {
 // 不同网关对 gemini 等模型的支持不同，由用户设置默认或测试验证）。
 const IMAGE_MODEL_RE = /image|imagen/i
 
+// pi-ai 内置 provider catalog 的默认 baseURL（常用渠道静态兜底表）。
+// DSH 模型设置里 provider 可以不填 baseURL：llm-pi-ai 适配器会回退到
+// pi-ai 内置 catalog 的默认地址（spec.baseURL ?? catalog.baseUrl），
+// 所以「没填 baseURL」的 provider 在 DSH 里照常能聊天。本插件必须对齐
+// 这一行为，否则会整家跳过这类 provider，其生图模型永远发现不了。
+const STATIC_CATALOG_BASE = {
+  openrouter: 'https://openrouter.ai/api/v1',
+  openai: 'https://api.openai.com/v1',
+  deepseek: 'https://api.deepseek',
+  groq: 'https://api.groq.com/openai/v1',
+  together: 'https://api.together.ai/v1',
+  moonshotai: 'https://api.moonshot.ai/v1',
+  'moonshotai-cn': 'https://api.moonshot.cn/v1',
+}
+// 动态 import pi-ai（dsh-llm-pi-ai 的依赖，宿主一定装有）：拿全量 catalog，
+// 失败（组合里没有 / 安装布局不同）则退回上面的静态表。结果进程内缓存。
+let catalogBaseCache
+async function catalogBaseUrls() {
+  if (catalogBaseCache) return catalogBaseCache
+  const map = { ...STATIC_CATALOG_BASE }
+  try {
+    const mod = await import('@earendil-works/pi-ai/providers/all')
+    for (const p of mod.builtinProviders?.() ?? []) {
+      if (p?.id && typeof p.baseUrl === 'string' && p.baseUrl) map[p.id] = p.baseUrl
+    }
+  } catch {
+    // 不可解析：静态表兜底
+  }
+  catalogBaseCache = map
+  return map
+}
+
 /** 把渠道探测结果渲染成给用户看的中文报告（render 纯函数）。 */
 function renderBackendReport(value) {
   const channels = Array.isArray(value?.channels) ? value.channels : []
@@ -245,10 +277,13 @@ export function apply(ctx, config) {
       return []
     }
     if (!providers || typeof providers !== 'object') return []
+    // catalog 回退要在读 settings 之后：openrouter 等内置 provider 常不填 baseURL
+    const catalog = await catalogBaseUrls()
     const out = []
     for (const [id, p] of Object.entries(providers)) {
       if (!p || typeof p !== 'object') continue
-      const baseURL = typeof p.baseURL === 'string' ? p.baseURL : ''
+      // 有效 baseURL：profile 显式值 > pi-ai 内置 catalog 默认值（对齐 llm-pi-ai 的解析）
+      const baseURL = (typeof p.baseURL === 'string' ? p.baseURL.trim() : '') || catalog[id] || ''
       if (!baseURL) continue
       const keyRef = typeof p.apiKeyEnv === 'string' ? p.apiKeyEnv : ''
       let key = ''
@@ -411,11 +446,14 @@ export function apply(ctx, config) {
       let baseURL = ''
       let key = ''
       if (section) {
-        if (typeof section.baseURL === 'string' && section.baseURL) baseURL = section.baseURL
+        if (typeof section.baseURL === 'string' && section.baseURL.trim()) baseURL = section.baseURL.trim()
         if (typeof section.apiKeyEnv === 'string' && section.apiKeyEnv) {
           const cred = await credentials?.resolve(section.apiKeyEnv).catch(() => undefined)
           if (cred) key = cred.value
         }
+        // profile 没填 baseURL：回退 pi-ai 内置 catalog（与 llm-pi-ai 适配器一致，
+        // openrouter 等 DSH 内置 provider 不填地址也能正常工作）
+        if (!baseURL) baseURL = (await catalogBaseUrls())[backend] || ''
       }
       if (!baseURL && config.gateway) {
         baseURL = config.gateway

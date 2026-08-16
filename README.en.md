@@ -13,6 +13,8 @@ Two image-generation methods are supported:
 - **API**: Uses OpenAI-compatible providers already configured in DSH and finds their available image models.
 - **CLI**: Scans the local machine for the MiniMax CLI (`mmx`). When it is found, it becomes an available image-generation backend.
 
+For built-in providers (e.g. OpenRouter) whose base URL is left blank in DSH settings, the plugin falls back to DSH's built-in default endpoint, matching how chat routing resolves them.
+
 ### Install
 
 ```sh
