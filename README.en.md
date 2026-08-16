@@ -6,16 +6,26 @@ Use image-generation tools already available to [DeepSeek Harness (DSH)](https:/
 
 ![An image generated in a DSH conversation](assets/1.png)
 
-### Overview
+## Overview
 
 Two image-generation methods are supported:
 
-- **API**: Uses OpenAI-compatible providers already configured in DSH and finds their available image models.
-- **CLI**: Scans the local machine for the MiniMax CLI (`mmx`). When it is found, it becomes an available image-generation backend.
+### API
 
-For built-in providers (e.g. OpenRouter) whose base URL is left blank in DSH settings, the plugin falls back to DSH's built-in default endpoint, matching how chat routing resolves them.
+- Uses OpenAI-compatible providers already configured in DSH and finds their available image models.
 
-### Install
+- For built-in providers (e.g. OpenRouter) whose base URL is left blank in DSH settings, the plugin falls back to DSH's built-in default endpoint, matching how chat routing resolves them.
+
+### CLI
+
+The plugin scans the local machine for the MiniMax CLI (`mmx`), the OpenAI Codex CLI (`codex`), and the Google Antigravity CLI (`agy`); each one found becomes an available image-generation backend.
+
+- Calling `codex` spends your **ChatGPT account (Plus/Pro) quota** rather than an API key. Requires the codex CLI installed and signed in to an account with image quota left (check with `codex login status`).
+- Calling `agy` spends your **Google account quota**. Requires the agy CLI installed and signed in via the Antigravity app.
+- When codex / agy is detected, the plugin also registers the skill **`cli-image-gen`**, which teaches the model to drive the CLIs for image generation when the `generate_image` tool fails (quota / region restrictions / parsing), and to finish with inline display via `show_image_file`.
+
+
+## Install
 
 ```sh
 dsh plugin --profile web add github:corrinehu/dsh-chat-imagine
@@ -33,24 +43,26 @@ The plugin checks available channels and models, then asks which one to use as t
 
 ![Choose a default image backend](assets/2.png)
 
-Once you set a default, later requests can go straight to generation:
+Once set, you don't need to choose again. Just describe the image you want in the chat:
 
 ```text
 Generate a 16:9 sunrise over snowy mountains.
-Create a minimal illustration for a technical blog cover.
 ```
 
-The result appears in the chat.
+The result appears directly in the chat.
 
 You can also use another image backend:
 
 ![Choose a non-default backend](assets/3.png)
 
-Just name the backend you want in the conversation, for example:
+Just say so in the conversation, for example:
 
 ```text
-Use a GPT image model to generate a WeChat article cover.
+Use agy to generate a widescreen hand-drawn colored-pencil diagram explaining LLM post-training.
 ```
+
+![Image generated via agy](assets/4.png)
+
 
 ## Notes
 
