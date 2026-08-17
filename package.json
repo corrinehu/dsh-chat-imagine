@@ -1,7 +1,7 @@
 {
   "name": "dsh-chat-imagine",
   "version": "0.1.1",
-  "description": "Generate images via API (image models filtered from those already set up in DSH) or local CLIs (MiniMax mmx), probe available backends, and display images inline in the chat.",
+  "description": "Generate and display images inline in the DSH chat via API channels (image models already set up in DSH) or local CLIs (mmx / codex / agy, each spending an existing account quota), with backend probing and a bundled recovery skill.",
   "type": "module",
   "main": "index.js",
   "files": [
