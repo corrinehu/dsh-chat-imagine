@@ -877,7 +877,7 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'analyze_image',
     description:
-      'Read an image (local file path or http(s) URL) and return structured evidence: full transcription (ocr.full_text), reading-order layout regions, semantics (scene/entities/relations), visual notes, and an uncertainty list — the same evidence contract as modlens, running on the mmx/codex/agy CLI channels this plugin already probes. Works on ANY model: no vision model, no route switching. PREREQUISITE: at least ONE of the mmx / codex / agy CLIs installed on this machine (any one suffices — the tool auto-picks the first available; if none is found the call returns an explanatory error — do not retry, just tell the user no vision CLI was found so image reading is unavailable). Use whenever the current model cannot see an image the user pasted or referenced (screenshot, photo, chart, diagram, document scan) — quote the evidence instead of guessing. Also for precise extraction: OCR, table/form reading, UI element inventory.',
+      'Read an image (local file path or http(s) URL) and return structured evidence: full transcription (ocr.full_text), reading-order layout regions, semantics (scene/entities/relations), visual notes, and an uncertainty list — the same evidence contract as modlens, running on the mmx/codex/agy CLI channels this plugin already probes. Works on ANY model: no vision model, no route switching. PREREQUISITE: at least ONE of the mmx / codex / agy CLIs installed on this machine (any one suffices — the tool auto-picks the first available; if none is found the call returns an explanatory error — do not retry, just tell the user no CLI was found so image reading is unavailable). Use whenever the current model cannot see an image the user pasted or referenced (screenshot, photo, chart, diagram, document scan) — quote the evidence instead of guessing. Also for precise extraction: OCR, table/form reading, UI element inventory.',
     parameters: {
       path: { type: 'string', required: true, description: 'Absolute local file path or http(s) URL of the image.' },
       prompt: { type: 'string', description: 'Optional extra focus for the reading, e.g. "focus on the axis labels".' },
@@ -918,7 +918,7 @@ export function apply(ctx, config) {
       }
       if (!backend) {
         throw new Error(
-          'analyze_image: no vision CLI found — none of mmx / codex / agy is installed, so image reading is unavailable. Any ONE of them suffices (all three return the same evidence). ' +
+          'analyze_image: CLI not found — none of mmx / codex / agy is installed, so image reading is unavailable. Any ONE of them suffices (all three return the same evidence). ' +
           'If a CLI runs in the terminal but is not detected here, the DSH host PATH is narrower than the interactive shell (common on Linux): set the plugin config mmxBin/codexBin/agyBin to the absolute path from `which <cli>`. ' +
           'Tell the user image reading is unavailable unless they install one of the CLIs (mmx: npm install -g mmx-cli / codex: ChatGPT CLI / agy: Google Antigravity CLI).',
         )

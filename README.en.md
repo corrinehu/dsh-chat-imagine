@@ -28,7 +28,7 @@ The plugin scans the local machine for the MiniMax CLI (`mmx`), the OpenAI Codex
 
 #### Image Recognition
 
-- Recognition uses the **same CLI channels' vision capabilities** (mmx's `vision describe`, codex's `exec -i` with image input + server-enforced JSON schema, agy's `--json-schema`). So **installing any one of mmx / codex / agy enables image recognition** — no need to install all three; if none is installed the plugin still works, only `analyze_image` returns "no vision CLI found, image reading unavailable".
+- Recognition uses the **same CLI channels' vision capabilities** (mmx's `vision describe`, codex's `exec -i` with image input + server-enforced JSON schema, agy's `--json-schema`). So **installing any one of mmx / codex / agy enables image recognition** — no need to install all three; if none is installed the plugin still works, only `analyze_image` returns a "CLI not found" notice.
 - Reads an image (local path or http(s) URL) into **structured JSON evidence**: OCR full text and per-line text, reading-order layout regions, semantic entities and relations, visual notes, and an uncertainty list — any model (including text-only) can call it directly, with no vision-model switching.
 - Channel auto-picks by speed (`mmx` → `codex` → `agy`); you can also pin a default with the `visionBackend` parameter of `set_image_default`.
 
