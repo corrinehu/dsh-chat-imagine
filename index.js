@@ -1,9 +1,19 @@
-import { mkdir, readFile, readdir, stat } from 'node:fs/promises'
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import {
+  VISION_SCHEMA,
+  VISION_EXT_OK,
+  strictSchema,
+  visionPrompt,
+  VISION_JSON_TEMPLATE,
+  assembleVisionResult,
+  renderVisionEvidence,
+  visionOutputSchema,
+} from './vision.js'
 
 const MIME_BY_EXT = {
   '.png': 'image/png',
@@ -70,6 +80,11 @@ function renderBackendReport(value) {
     if (channels.some((ch) => ch.kind === 'cli' && ch.id !== 'mmx')) {
       lines.push('说明：codex / agy 是「CLI 套壳」渠道——把提示词交给本机已登录的 codex（ChatGPT 账号）或 agy（Google 账号）CLI，用其内置生图工具出图，消耗对应账号额度而非 API key。对调用方完全透明：prompt 照常写画面描述即可，不需要任何命令行知识，插件内部会负责调用与取回图片。API 渠道没额度时它们是现成的备用。')
     }
+    lines.push('')
+    const visionChannels = channels.filter((ch) => ch.kind === 'cli').map((ch) => ch.id)
+    if (visionChannels.length > 0) {
+      lines.push(`识图（analyze_image）：本机 CLI 渠道 ${visionChannels.join(' / ')} 均可读取图片并返回结构化 JSON 证据（OCR / 版面 / 语义），任何模型可直接调用，无需切换视觉模型。`)
+    }
   }
   lines.push('')
   lines.push('结构化结果（供精确调用）：')
@@ -134,6 +149,8 @@ export function apply(ctx, config) {
         settings.register(LEDGER_NS, Schema.object({
           defaultBackend: Schema.string().default(''),
           defaultModel: Schema.string().default(''),
+          // 识图默认渠道（可选）：留空则按探测顺序自动选（mmx 最快优先）
+          visionBackend: Schema.string().default(''),
         }))
       } catch {
         // 已注册或不可用：忽略，仍尝试 get/update
@@ -144,15 +161,16 @@ export function apply(ctx, config) {
   }
   function currentLedger() {
     const settings = ensureLedger()
-    if (!settings) return { defaultBackend: '', defaultModel: '' }
+    if (!settings) return { defaultBackend: '', defaultModel: '', visionBackend: '' }
     try {
       const v = settings.get(LEDGER_NS)
       return {
         defaultBackend: typeof v?.defaultBackend === 'string' ? v.defaultBackend : '',
         defaultModel: typeof v?.defaultModel === 'string' ? v.defaultModel : '',
+        visionBackend: typeof v?.visionBackend === 'string' ? v.visionBackend : '',
       }
     } catch {
-      return { defaultBackend: '', defaultModel: '' }
+      return { defaultBackend: '', defaultModel: '', visionBackend: '' }
     }
   }
   async function writeLedger(patch) {
@@ -861,6 +879,217 @@ export function apply(ctx, config) {
     },
   }))
 
+  // ── 工具：识图（结构化 JSON 证据，契约借鉴 modlens）──────────
+  // 与生图共用 mmx/codex/agy 三个本机 CLI 渠道，但走各自的视觉能力：
+  //   mmx  — vision describe 直连 MiniMax VLM（最快，3-5s），无 schema 强制，
+  //          用 JSON 填空模板 + 宽松解析 + 结构校验兜底
+  //   codex — exec -i 附图 + --output-schema（OpenAI strict 模式），
+  //          schema 服务端强制，输出可靠；low 推理档省时间省额度
+  //   agy  — --print + --json-schema（envelope.structured_output），
+  //          flag 必须空格分隔（=value 语法解析有 bug，实测）
+  // 三个渠道返回同一份 VISION_SCHEMA 证据。选路：显式 backend > settings
+  // 账本的 visionBackend > 探测顺序 mmx → codex → agy（速度序）。
+  // 与 modlens 的区别：modlens 是独立引擎（要配置、接管模型路由、要求选
+  // visor 模型），本工具是插件内工具——任何模型直接调用，不切模型不改路由。
+  ctx.tools.register(defineTool({
+    name: 'analyze_image',
+    description:
+      'Read an image (local file path or http(s) URL) and return structured evidence: full transcription (ocr.full_text), reading-order layout regions, semantics (scene/entities/relations), visual notes, and an uncertainty list — the same evidence contract as modlens, running on the mmx/codex/agy CLI channels this plugin already probes. Works on ANY model: no vision model, no route switching. Use whenever the current model cannot see an image the user pasted or referenced (screenshot, photo, chart, diagram, document scan) — quote the evidence instead of guessing. Also for precise extraction: OCR, table/form reading, UI element inventory.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Absolute local file path or http(s) URL of the image.' },
+      prompt: { type: 'string', description: 'Optional extra focus for the reading, e.g. "focus on the axis labels".' },
+      backend: { type: 'string', description: 'Optional channel id: "mmx" (fastest, MiniMax VLM), "codex" (ChatGPT account, server-enforced JSON schema), "agy" (Google account, Gemini). Omit to use the configured vision default, else auto-pick the first available channel.' },
+    },
+    output: {
+      // VISION_SCHEMA 是标准 JSON Schema（喂给 codex/agy 的 --output-schema），
+      // dsh-tools 的 output.schema 是另一套 DSL，用派生的兼容形状。
+      schema: visionOutputSchema(),
+      render: (_a, value) => [{ type: 'text', text: renderVisionEvidence(value) }],
+    },
+    async execute(args, exec) {
+      const path = String(args.path ?? '').trim()
+      if (!path) throw new Error('analyze_image: path is required')
+      const isUrl = /^https?:\/\//i.test(path)
+      if (!isUrl && !VISION_EXT_OK.test(path)) {
+        throw new Error(
+          'analyze_image: unsupported image type. Supported extensions: .png .jpg .jpeg .webp .gif .heic .heif (or an http(s) URL).',
+        )
+      }
+      if (!isUrl) {
+        const st = await stat(path).catch(() => null)
+        if (!st || !st.isFile()) throw new Error('analyze_image: file not found: ' + path)
+      }
+
+      // 渠道选择：显式 > 账本默认（visionBackend）> 探测序（mmx 最快）
+      const explicit = String(args.backend ?? '').trim()
+      let backend = explicit
+      if (!backend) {
+        try {
+          const v = ctx.get('settings')?.get('dsh-chat-imagine')
+          backend = typeof v?.visionBackend === 'string' ? v.visionBackend : ''
+        } catch {}
+      }
+      if (!backend) {
+        const [mmx, codex, agy] = await Promise.all([mmxChannel(), codexChannel(), agyChannel()])
+        backend = mmx ? 'mmx' : codex ? 'codex' : agy ? 'agy' : ''
+      }
+      if (!backend) {
+        throw new Error(
+          'analyze_image: no vision channel available (none of mmx / codex / agy CLI found). Run list_image_backends to check, or install one of the CLIs.',
+        )
+      }
+
+      const prompt = visionPrompt(path, args.prompt)
+      const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
+      const startedAt = Date.now()
+
+      // ── mmx：vision describe 直连 VLM，输出自由文本（JSON 在 content 里）──
+      if (backend === 'mmx') {
+        const channel = await mmxChannel()
+        if (!channel) throw new Error('analyze_image: mmx CLI not found on this machine. If the CLI runs fine in your terminal but is not found here, the DSH host process PATH is narrower than your interactive shell (common on Linux with nvm/npm-global installs): set the plugin config key (mmxBin/codexBin/agyBin) to the absolute binary path (run `which <cli>` in your terminal to get it), then retry.')
+        const shell = ctx.get('shell')
+        if (!shell) throw new Error('analyze_image: shell service unavailable')
+        const bin = channel.bin || config.mmxBin
+        const question = prompt + '\n\n' + VISION_JSON_TEMPLATE
+        const cmd =
+          bin + ' vision describe --image ' + shq(path) +
+          ' --prompt ' + shq(question) + ' --output json --non-interactive --quiet'
+        const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 120000))
+        if (run.code !== 0) {
+          throw new Error('analyze_image: mmx failed (exit ' + run.code + '): ' + (run.err || run.out).slice(-500))
+        }
+        let envelope
+        try {
+          envelope = JSON.parse(run.out)
+        } catch {
+          throw new Error('analyze_image: mmx output is not JSON: ' + run.out.slice(0, 300))
+        }
+        if (envelope?.base_resp?.status_code && envelope.base_resp.status_code !== 0) {
+          throw new Error('analyze_image: mmx API error ' + envelope.base_resp.status_code + ': ' + (envelope.base_resp.status_msg || ''))
+        }
+        // mmx 高密度图会无视 JSON 模板返回散文：不强制、不报错，交给组装器
+        // 从原料里提取并兜底（散文进 summary 并标注降级）。
+        const result = assembleVisionResult(envelope?.content ?? '', 'mmx')
+        if (!result) {
+          throw new Error('analyze_image: mmx returned no usable content: ' + String(envelope?.content ?? '').slice(0, 300))
+        }
+        return { ...result, _meta: { channel: 'mmx', model: 'MiniMax VLM', durationSeconds: ((Date.now() - startedAt) / 1000).toFixed(1) } }
+      }
+
+      // ── codex：exec -i 附图 + --output-schema（OpenAI strict，服务端强制）──
+      if (backend === 'codex') {
+        const channel = await codexChannel()
+        if (!channel) throw new Error('analyze_image: codex CLI not found on this machine. If the CLI runs fine in your terminal but is not found here, the DSH host process PATH is narrower than your interactive shell (common on Linux with nvm/npm-global installs): set the plugin config key (mmxBin/codexBin/agyBin) to the absolute binary path (run `which <cli>` in your terminal to get it), then retry.')
+        const shell = ctx.get('shell')
+        if (!shell) throw new Error('analyze_image: shell service unavailable')
+        const bin = channel.bin || config.codexBin
+        // 临时目录：放 schema 文件（--output-schema 只吃文件路径）+ 本地图片的
+        // 隔离副本（codex -i 的相对路径基于 cwd；隔离目录防图片内注入读兄弟文件，
+        // modlens isolateWorkdir 同款思路）
+        const dir = join(tmpdir(), 'dsh-chat-imagine-vision-' + Date.now())
+        await mkdir(dir, { recursive: true })
+        const schemaFile = join(dir, 'schema.json')
+        await writeFile(schemaFile, JSON.stringify(strictSchema(VISION_SCHEMA)))
+        let imgArg = path
+        if (!isUrl) {
+          const extMatch = path.match(/\.[a-z0-9]+$/i)
+          const ext = extMatch ? extMatch[0].toLowerCase() : '.png'
+          const copyPath = join(dir, 'image' + ext)
+          await writeFile(copyPath, await readFile(path))
+          imgArg = copyPath
+        }
+        const cmd =
+          bin + ' exec --skip-git-repo-check --ephemeral -s read-only' +
+          ' -c ' + JSON.stringify('model_reasoning_effort="low"') +
+          ' -i ' + shq(imgArg) +
+          ' --output-schema ' + shq(schemaFile) + ' ' +
+          shq(prompt) +
+          ' < /dev/null'
+        // ↑ 经 shell 服务运行时 stdin 是打开的管道，codex 会打印
+        // "Reading additional input from stdin..." 然后阻塞等待输入直到
+        // 超时（终端手跑没事因为 stdin 是关闭的）。重定向 /dev/null 让它
+        // 立即读到 EOF——实测修复。
+        const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 240000))
+        if (run.code !== 0) {
+          throw new Error(
+            'analyze_image: codex failed (exit ' + run.code + ')' +
+              (run.code === -1 ? '，疑似超时（完整 schema 输出较慢，可重试或换 backend "mmx" / "agy"）' : '') +
+              ': ' + (run.err || run.out).slice(-300),
+          )
+        }
+        const output = run.out + '\n' + run.err
+        // codex 的 stdout 是整个会话记录（会话头、schema 校验失败的半截
+        // JSON、模型自我重试旁白都可能混在里面）。组装器的平衡括号扫描
+        // 会跳过损坏段，找到真正可解析的最终对象；都找不到则兜底降级。
+        const result = assembleVisionResult(output, 'codex')
+        return { ...result, _meta: { channel: 'codex', model: 'gpt-5.x (codex)', durationSeconds: ((Date.now() - startedAt) / 1000).toFixed(1) } }
+      }
+
+      // ── agy：--print + --json-schema（envelope.structured_output）────
+      if (backend === 'agy') {
+        const channel = await agyChannel()
+        if (!channel) throw new Error('analyze_image: agy CLI not found on this machine. If the CLI runs fine in your terminal but is not found here, the DSH host process PATH is narrower than your interactive shell (common on Linux with nvm/npm-global installs): set the plugin config key (mmxBin/codexBin/agyBin) to the absolute binary path (run `which <cli>` in your terminal to get it), then retry.')
+        const shell = ctx.get('shell')
+        if (!shell) throw new Error('analyze_image: shell service unavailable')
+        const bin = channel.bin || config.agyBin
+        const dir = join(tmpdir(), 'dsh-chat-imagine-vision-' + Date.now())
+        await mkdir(dir, { recursive: true })
+        const schemaFile = join(dir, 'schema.json')
+        // agy 对 schema 无 strict 要求，直接用原生 VISION_SCHEMA
+        await writeFile(schemaFile, JSON.stringify(VISION_SCHEMA))
+        // agy 的 flag 解析有两个实测坑：① 必须 --key value 空格分隔（=value 会
+        // 碎片化）；② prompt 必须放在第一个 flag 位置（-p 紧跟二进制名）——
+        // 放后面时其它 flag 会被误吞进 prompt 文本，输出变成闲聊而非 JSON。
+        // 图片让 agent 读绝对路径（prompt 里已带）。在隔离目录里跑（防注入）。
+        const cmd =
+          'cd ' + shq(dir) + ' && ' + bin +
+          ' -p ' + shq(prompt) +
+          ' --dangerously-skip-permissions --output-format json --json-schema ' + shq(schemaFile) +
+          ' --model gemini-3.7-flash-low --print-timeout 120s'
+        const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 180000))
+        if (run.code !== 0 && !run.out.trim()) {
+          throw new Error('analyze_image: agy failed (exit ' + run.code + '): ' + (run.err || run.out).slice(-500))
+        }
+        let envelope
+        try {
+          envelope = JSON.parse(run.out)
+        } catch {
+          envelope = null
+        }
+        if (envelope?.status && envelope.status !== 'SUCCESS') {
+          // agy 对 auth/quota 一律 exit 1 + "Agent execution terminated due to error"，
+          // 真实原因在其日志里（modlens 的经验）。给用户可操作的指引。
+          throw new Error(
+            'analyze_image: agy reported status ' + envelope.status +
+              ' ("' + String(envelope.error ?? '').slice(0, 120) + '").' +
+              ' Common causes: Google 账号额度用尽（agy 免费档是周桶，桌面 App/CLI/SDK 共享，重试或换渠道）、未登录、或区域限制。' +
+              ' 可换 backend "mmx" 或 "codex" 重试，或在终端跑一次 agy 看具体报错。',
+          )
+        }
+        // agy 的 structured_output 已是对象；response 是自由文本（可能含
+        // JSON），两者都交给组装器统一处理（对象走字段级修复路径）。
+        const rawResult = envelope?.structured_output ?? envelope?.response ?? ''
+        const result = assembleVisionResult(
+          typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult),
+          'agy',
+        )
+        if (!result) {
+          throw new Error('analyze_image: agy returned no usable content: ' + (run.out || run.err).slice(0, 300))
+        }
+        return {
+          ...result,
+          _meta: {
+            channel: 'agy',
+            model: 'gemini-3.7-flash-low',
+            durationSeconds: envelope?.duration_seconds ?? ((Date.now() - startedAt) / 1000).toFixed(1),
+          },
+        }
+      }
+
+      throw new Error('analyze_image: unknown backend "' + backend + '". Use mmx, codex or agy.')
+    },
+  }))
+
   // ── 工具：设置默认生图渠道/模型（写入 settings 账本，热生效）──
   ctx.tools.register(defineTool({
     name: 'set_image_default',
@@ -868,6 +1097,7 @@ export function apply(ctx, config) {
     parameters: {
       backend: { type: 'string', required: true, description: 'Channel id to use as default, e.g. "mmx", "codex", "agy" or "openrouter".' },
       model: { type: 'string', description: 'Optional model id to pin as default, e.g. "image-01" (mmx), "image-gen" (codex) or "gpt-image-2". Omit to clear the pinned model (channel default applies).' },
+      visionBackend: { type: 'string', description: 'Optional default channel for analyze_image (image reading), e.g. "mmx" (fastest), "codex" or "agy". Pass only when the user also wants to pin the vision default; empty string clears it (auto-pick by speed).' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     async execute(args, exec) {
@@ -882,12 +1112,23 @@ export function apply(ctx, config) {
         }
         throw new Error(`set_image_default: backend "${backend}" is not available. Available: ${channels.map((b) => b.id).join(', ')}`)
       }
-      const ok = await writeLedger({ defaultBackend: backend, defaultModel: model })
+      // visionBackend 只在明确传入时更新（含空串清除）；未传不动现有值
+      const patch = { defaultBackend: backend, defaultModel: model }
+      if (args.visionBackend !== undefined) {
+        const vb = String(args.visionBackend ?? '').trim()
+        if (vb && !['mmx', 'codex', 'agy'].includes(vb)) {
+          throw new Error('set_image_default: visionBackend must be one of mmx / codex / agy (API channels have no vision support).')
+        }
+        patch.visionBackend = vb
+      }
+      const ok = await writeLedger(patch)
       if (!ok) {
         throw new Error('set_image_default: could not persist the default (settings service unavailable). Edit cordis.yml config defaultBackend/defaultModel instead.')
       }
+      const ledger = currentLedger()
+      const visionNote = ledger.visionBackend ? `\n识图默认渠道：${ledger.visionBackend}（analyze_image 用）` : ''
       const def = effectiveDefaults()
-      return `✅ 默认生图设置已保存：渠道 ${def.defaultBackend}${def.defaultModel ? `，模型 ${def.defaultModel}` : '（模型不固定，用渠道默认）'}。\n以后直接说"生成一张图"就会用这个默认设置；想修改随时再调用本工具。`
+      return `✅ 默认生图设置已保存：渠道 ${def.defaultBackend}${def.defaultModel ? `，模型 ${def.defaultModel}` : '（模型不固定，用渠道默认）'}。${visionNote}\n以后直接说"生成一张图"就会用这个默认设置；想修改随时再调用本工具。`
     },
   }))
 }

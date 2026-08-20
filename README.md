@@ -64,6 +64,19 @@ dsh plugin --profile web add github:corrinehu/dsh-chat-imagine
 ![agy 生成图片](assets/4.png)
 
 
+## 识图（读图）
+
+插件探测到 mmx / codex / agy 三个本机 CLI 之一时，还会注册 `analyze_image` 工具：把图片（本地路径或 http(s) URL）读取成**结构化 JSON 证据**——OCR 全文与逐行文本、按阅读顺序排列的版面区域、语义实体与关系、视觉线索、不确定项清单。
+
+```text
+帮我读一下这张图 /tmp/screenshots/error.png，把报错原文抄出来
+```
+
+- **任何模型可用**：工具走 CLI 渠道的视觉模型（MiniMax VLM / ChatGPT / Gemini），当前会话不需要切换到视觉模型——这是与 modlens 那类「接管模型路由」方案的主要区别。
+- **契约借鉴 modlens**：同一份证据结构（五段式），刻意不含坐标框与置信度（视觉模型最容易编造的字段）。
+- **渠道选择**：`mmx`（最快，直连 VLM，约 3-8 秒）→ `codex`（服务端强制 JSON schema，最稳）→ `agy`（Gemini，额度周桶共享）。可用 `set_image_default` 的 `visionBackend` 参数固定默认识图渠道，不设则自动按速度选。
+- **失败降级**：某渠道额度耗尽时，对话里说明换一个即可（`backend` 参数或直接说「用 codex 读」）。
+
 ## 注意事项
 
 - 当前仅在 DSH Web profile 中测试通过。
