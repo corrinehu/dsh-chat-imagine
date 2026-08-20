@@ -66,7 +66,7 @@ dsh plugin --profile web add github:corrinehu/dsh-chat-imagine
 
 ## 识图（读图）
 
-插件探测到 mmx / codex / agy 三个本机 CLI 之一时，还会注册 `analyze_image` 工具：把图片（本地路径或 http(s) URL）读取成**结构化 JSON 证据**——OCR 全文与逐行文本、按阅读顺序排列的版面区域、语义实体与关系、视觉线索、不确定项清单。
+识图能力**依赖本机 CLI**：装了 mmx / codex / agy 任意一个，`analyze_image` 工具即可用（三者任一即可，无需全装）；一个都没装时插件照常工作，只是不提供识图——调用会返回「未发现 CLI，不支持识图」的说明。装好后工具把图片（本地路径或 http(s) URL）读取成**结构化 JSON 证据**——OCR 全文与逐行文本、按阅读顺序排列的版面区域、语义实体与关系、视觉线索、不确定项清单。
 
 ```text
 帮我读一下这张图 /tmp/screenshots/error.png，把报错原文抄出来

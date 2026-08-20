@@ -245,50 +245,88 @@ export function apply(ctx, config) {
     }
   }
 
+  // ── CLI 二进制探测（mmx/codex/agy 共用）────────────────────
+  // DSH host 进程的 PATH 往往比用户交互终端精简（GUI/systemd/非登录 shell
+  // 启动），Linux 上 npm -g 装到 nvm（~/.nvm/versions/node/*/bin）或用户
+  // 自设 prefix（~/.npm-global）时，会出现「终端能跑但插件探测不到」。
+  // 探测顺序：① 配置值与常见安装目录直查（不依赖 PATH）→ ② npm 全局
+  // 前缀 → ③ 当前 PATH command -v → ④ 登录 shell 里 command -v（source
+  // 用户 profile，PATH 与终端一致，覆盖 volta/asdf/pnpm 等自定义位置）。
+  async function probeCliBinary(shell, binName, debug) {
+    const home = homedir()
+    const name = String(binName ?? '').trim() || String(binName ?? '')
+    const candidates = [
+      name,
+      home ? `${home}/.local/bin/${name}` : '',
+      home ? `${home}/.npm-global/bin/${name}` : '',
+      home ? `${home}/.bun/bin/${name}` : '',
+      `/opt/homebrew/bin/${name}`,
+      `/usr/local/bin/${name}`,
+      `/usr/bin/${name}`,
+    ].filter(Boolean)
+    if (debug) debug.candidates = candidates
+    for (const c of candidates) {
+      const r = await shellOnce(shell, `test -x ${JSON.stringify(c)} && echo FOUND || echo NO`)
+      if (r.code === 0 && r.out.includes('FOUND')) {
+        if (debug) debug.found = c
+        return c
+      }
+    }
+    // npm 全局前缀：npm -g 在 Linux 的落点这一步一并覆盖（nvm / 自设 prefix）
+    try {
+      const r = await shellOnce(shell, 'npm prefix -g 2>/dev/null')
+      if (r.code === 0 && r.out) {
+        const npmBin = join(r.out.trim(), 'bin', name)
+        const c = await shellOnce(shell, `test -x ${JSON.stringify(npmBin)} && echo FOUND || echo NO`)
+        if (c.code === 0 && c.out.includes('FOUND')) {
+          if (debug) debug.found = npmBin
+          return npmBin
+        }
+      }
+    } catch {
+      // npm 不可用：跳过
+    }
+    // 当前 PATH 的 command -v（原有兜底）
+    const r = await shellOnce(shell, `command -v ${JSON.stringify(name)}`)
+    if (debug) debug.commandV = r
+    if (r.code === 0 && r.out) return r.out.split('\n')[0].trim()
+    // 登录/交互 shell 兜底：-l 会 source profile 链（.bash_profile/.profile/
+    // .zprofile），-i 会 source .bashrc/.zshrc——Linux 用户 PATH 常写在这两处。
+    // 四种组合按顺序试，命中即返回。PATH 与用户终端一致，覆盖 nvm/volta/
+    // asdf/pnpm 等任意自定义安装位置。各 15s 超时。
+    for (const [sh, flag] of [['bash', '-lc'], ['bash', '-ic'], ['zsh', '-lc'], ['zsh', '-ic']]) {
+      const lr = await shellOnce(
+        shell,
+        sh + ' ' + flag + ' ' + JSON.stringify('command -v ' + name) + ' 2>/dev/null',
+        15000,
+      )
+      if (lr.code === 0 && lr.out) {
+        const found = lr.out.split('\n')[0].trim()
+        if (found) {
+          if (debug) debug.loginShell = { shell: sh + ' ' + flag, found }
+          return found
+        }
+      }
+    }
+    return null
+  }
+
   async function probeMmx(debug) {
     const shell = ctx.get('shell')
     if (!shell) {
       if (debug) debug.shell = 'unavailable'
       return null
     }
-    const runCmd = (cmd) => shellOnce(shell, cmd)
-    // 候选：裸命令名 + 常见安装位置（shell 环境 PATH/HOME 可能不全，用 os.homedir()）
-    const home = homedir()
-    const candidates = [
-      config.mmxBin,
-      home ? `${home}/.local/bin/${config.mmxBin}` : '',
-      `/opt/homebrew/bin/${config.mmxBin}`,
-      `/usr/local/bin/${config.mmxBin}`,
-    ].filter(Boolean)
-    if (debug) debug.candidates = candidates
-    for (const c of candidates) {
-      const r = await runCmd(`test -x ${JSON.stringify(c)} && echo FOUND || echo NO`)
-      if (r.code === 0 && r.out.includes('FOUND')) {
-        if (debug) debug.found = c
-        return {
-          id: 'mmx',
-          kind: 'cli',
-          name: 'mmx CLI (MiniMax)',
-          bin: c,
-          note: '走 MiniMax 账号',
-          models: [{ id: 'image-01', name: 'MiniMax image-01' }],
-        }
-      }
+    const bin = await probeCliBinary(shell, config.mmxBin, debug)
+    if (!bin) return null
+    return {
+      id: 'mmx',
+      kind: 'cli',
+      name: 'mmx CLI (MiniMax)',
+      bin,
+      note: '走 MiniMax 账号',
+      models: [{ id: 'image-01', name: 'MiniMax image-01' }],
     }
-    // 兜底：command -v
-    const r = await runCmd(`command -v ${config.mmxBin}`)
-    if (debug) debug.commandV = r
-    if (r.code === 0 && r.out) {
-      return {
-        id: 'mmx',
-        kind: 'cli',
-        name: 'mmx CLI (MiniMax)',
-        bin: r.out,
-        note: '走 MiniMax 账号',
-        models: [{ id: 'image-01', name: 'MiniMax image-01' }],
-      }
-    }
-    return null
   }
 
   // 进程内缓存 mmx 探测结果：生成路径不必每次都找二进制
@@ -308,42 +346,16 @@ export function apply(ctx, config) {
       if (debug) debug.shell = 'unavailable'
       return null
     }
-    const home = homedir()
-    const candidates = [
-      config.codexBin,
-      home ? `${home}/.local/bin/${config.codexBin}` : '',
-      `/opt/homebrew/bin/${config.codexBin}`,
-      `/usr/local/bin/${config.codexBin}`,
-    ].filter(Boolean)
-    if (debug) debug.candidates = candidates
-    for (const c of candidates) {
-      const r = await shellOnce(shell, `test -x ${JSON.stringify(c)} && echo FOUND || echo NO`)
-      if (r.code === 0 && r.out.includes('FOUND')) {
-        if (debug) debug.found = c
-        return {
-          id: 'codex',
-          kind: 'cli',
-          name: 'codex CLI (ChatGPT)',
-          bin: c,
-          note: '走 ChatGPT 账号额度',
-          models: [{ id: 'image-gen', name: 'codex 内置 image_gen' }],
-        }
-      }
+    const bin = await probeCliBinary(shell, config.codexBin, debug)
+    if (!bin) return null
+    return {
+      id: 'codex',
+      kind: 'cli',
+      name: 'codex CLI (ChatGPT)',
+      bin,
+      note: '走 ChatGPT 账号额度',
+      models: [{ id: 'image-gen', name: 'codex 内置 image_gen' }],
     }
-    // 兜底：command -v
-    const r = await shellOnce(shell, `command -v ${config.codexBin}`)
-    if (debug) debug.commandV = r
-    if (r.code === 0 && r.out) {
-      return {
-        id: 'codex',
-        kind: 'cli',
-        name: 'codex CLI (ChatGPT)',
-        bin: r.out,
-        note: '走 ChatGPT 账号额度',
-        models: [{ id: 'image-gen', name: 'codex 内置 image_gen' }],
-      }
-    }
-    return null
   }
 
   // 进程内缓存 codex 探测结果
@@ -363,49 +375,20 @@ export function apply(ctx, config) {
       if (debug) debug.shell = 'unavailable'
       return null
     }
-    const home = homedir()
-    const candidates = [
-      config.agyBin,
-      home ? `${home}/.local/bin/${config.agyBin}` : '',
-      `/opt/homebrew/bin/${config.agyBin}`,
-      `/usr/local/bin/${config.agyBin}`,
-    ].filter(Boolean)
-    if (debug) debug.candidates = candidates
-    for (const c of candidates) {
-      const r = await shellOnce(shell, `test -x ${JSON.stringify(c)} && echo FOUND || echo NO`)
-      if (r.code === 0 && r.out.includes('FOUND')) {
-        if (debug) debug.found = c
-        return {
-          id: 'agy',
-          kind: 'cli',
-          name: 'agy CLI (Google Antigravity)',
-          bin: c,
-          note: '走 Google 账号额度',
-          models: [
-            { id: 'gemini-3.7-flash-low', name: 'Gemini 3.7 Flash (Low) · 默认' },
-            { id: 'gemini-3.7-flash-medium', name: 'Gemini 3.7 Flash (Medium)' },
-            { id: 'gemini-3.7-flash-high', name: 'Gemini 3.7 Flash (High)' },
-          ],
-        }
-      }
+    const bin = await probeCliBinary(shell, config.agyBin, debug)
+    if (!bin) return null
+    return {
+      id: 'agy',
+      kind: 'cli',
+      name: 'agy CLI (Google Antigravity)',
+      bin,
+      note: '走 Google 账号额度',
+      models: [
+        { id: 'gemini-3.7-flash-low', name: 'Gemini 3.7 Flash (Low) · 默认' },
+        { id: 'gemini-3.7-flash-medium', name: 'Gemini 3.7 Flash (Medium)' },
+        { id: 'gemini-3.7-flash-high', name: 'Gemini 3.7 Flash (High)' },
+      ],
     }
-    const r = await shellOnce(shell, `command -v ${config.agyBin}`)
-    if (debug) debug.commandV = r
-    if (r.code === 0 && r.out) {
-      return {
-        id: 'agy',
-        kind: 'cli',
-        name: 'agy CLI (Google Antigravity)',
-        bin: r.out,
-        note: '走 Google 账号额度',
-        models: [
-          { id: 'gemini-3.7-flash-low', name: 'Gemini 3.7 Flash (Low) · 默认' },
-          { id: 'gemini-3.7-flash-medium', name: 'Gemini 3.7 Flash (Medium)' },
-          { id: 'gemini-3.7-flash-high', name: 'Gemini 3.7 Flash (High)' },
-        ],
-      }
-    }
-    return null
   }
 
   // 进程内缓存 agy 探测结果
@@ -620,7 +603,7 @@ export function apply(ctx, config) {
       if (!section && backend === 'mmx') {
         const channel = await mmxChannel()
         if (!channel) {
-          throw new Error('generate_image: mmx CLI not found on this machine. Run list_image_backends to see available channels.')
+          throw new Error('generate_image: mmx CLI not found on this machine. Run list_image_backends to see available channels. If the CLI runs fine in your terminal but is not found here, the DSH host process PATH is narrower than your interactive shell (common on Linux with nvm/npm-global installs): set the plugin config key (mmxBin/codexBin/agyBin) to the absolute binary path (run `which <cli>` in your terminal to get it), then retry.')
         }
         const shell = ctx.get('shell')
         if (!shell) throw new Error('generate_image: shell service unavailable for the CLI backend')
@@ -669,7 +652,7 @@ export function apply(ctx, config) {
       if (!section && backend === 'codex') {
         const channel = await codexChannel()
         if (!channel) {
-          throw new Error('generate_image: codex CLI not found on this machine. Run list_image_backends to see available channels.')
+          throw new Error('generate_image: codex CLI not found on this machine. Run list_image_backends to see available channels. If the CLI runs fine in your terminal but is not found here, the DSH host process PATH is narrower than your interactive shell (common on Linux with nvm/npm-global installs): set the plugin config key (mmxBin/codexBin/agyBin) to the absolute binary path (run `which <cli>` in your terminal to get it), then retry.')
         }
         const shell = ctx.get('shell')
         if (!shell) throw new Error('generate_image: shell service unavailable for the CLI backend')
@@ -732,7 +715,7 @@ export function apply(ctx, config) {
       if (!section && backend === 'agy') {
         const channel = await agyChannel()
         if (!channel) {
-          throw new Error('generate_image: agy CLI not found on this machine. Run list_image_backends to see available channels.')
+          throw new Error('generate_image: agy CLI not found on this machine. Run list_image_backends to see available channels. If the CLI runs fine in your terminal but is not found here, the DSH host process PATH is narrower than your interactive shell (common on Linux with nvm/npm-global installs): set the plugin config key (mmxBin/codexBin/agyBin) to the absolute binary path (run `which <cli>` in your terminal to get it), then retry.')
         }
         const shell = ctx.get('shell')
         if (!shell) throw new Error('generate_image: shell service unavailable for the CLI backend')
@@ -894,7 +877,7 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'analyze_image',
     description:
-      'Read an image (local file path or http(s) URL) and return structured evidence: full transcription (ocr.full_text), reading-order layout regions, semantics (scene/entities/relations), visual notes, and an uncertainty list — the same evidence contract as modlens, running on the mmx/codex/agy CLI channels this plugin already probes. Works on ANY model: no vision model, no route switching. Use whenever the current model cannot see an image the user pasted or referenced (screenshot, photo, chart, diagram, document scan) — quote the evidence instead of guessing. Also for precise extraction: OCR, table/form reading, UI element inventory.',
+      'Read an image (local file path or http(s) URL) and return structured evidence: full transcription (ocr.full_text), reading-order layout regions, semantics (scene/entities/relations), visual notes, and an uncertainty list — the same evidence contract as modlens, running on the mmx/codex/agy CLI channels this plugin already probes. Works on ANY model: no vision model, no route switching. PREREQUISITE: at least ONE of the mmx / codex / agy CLIs installed on this machine (any one suffices — the tool auto-picks the first available; if none is found the call returns an explanatory error — do not retry, just tell the user no vision CLI was found so image reading is unavailable). Use whenever the current model cannot see an image the user pasted or referenced (screenshot, photo, chart, diagram, document scan) — quote the evidence instead of guessing. Also for precise extraction: OCR, table/form reading, UI element inventory.',
     parameters: {
       path: { type: 'string', required: true, description: 'Absolute local file path or http(s) URL of the image.' },
       prompt: { type: 'string', description: 'Optional extra focus for the reading, e.g. "focus on the axis labels".' },
@@ -935,7 +918,9 @@ export function apply(ctx, config) {
       }
       if (!backend) {
         throw new Error(
-          'analyze_image: no vision channel available (none of mmx / codex / agy CLI found). Run list_image_backends to check, or install one of the CLIs.',
+          'analyze_image: no vision CLI found — none of mmx / codex / agy is installed, so image reading is unavailable. Any ONE of them suffices (all three return the same evidence). ' +
+          'If a CLI runs in the terminal but is not detected here, the DSH host PATH is narrower than the interactive shell (common on Linux): set the plugin config mmxBin/codexBin/agyBin to the absolute path from `which <cli>`. ' +
+          'Tell the user image reading is unavailable unless they install one of the CLIs (mmx: npm install -g mmx-cli / codex: ChatGPT CLI / agy: Google Antigravity CLI).',
         )
       }
 
