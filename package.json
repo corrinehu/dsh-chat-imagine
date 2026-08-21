@@ -1,6 +1,6 @@
 {
   "name": "dsh-chat-imagine",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Generate and display images inline in the DSH chat via API channels or local CLIs (mmx / codex / agy), and read images into structured JSON evidence (OCR / layout / semantics) on any model — with backend probing and a bundled recovery skill.",
   "type": "module",
   "main": "index.js",
