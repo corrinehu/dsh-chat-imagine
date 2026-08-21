@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -124,6 +124,11 @@ export function apply(ctx, config) {
   const MAX_TOTAL_BYTES = 128 * 1024 * 1024
   let totalBytes = 0
   const remember = (bytes, mime) => {
+    // 单图上限：超过总预算就直接拒绝而非「存了又立刻被淘汰」（否则返回的
+    // id 立即失效 → 静默 404）。调用方会看到明确的错误而不是死链接。
+    if (bytes.length > MAX_TOTAL_BYTES) {
+      throw new Error(`generate_image: image is ${bytes.length} bytes, exceeding the per-image cap of ${MAX_TOTAL_BYTES}`)
+    }
     const id = `i${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
     store.set(id, { bytes, mime })
     totalBytes += bytes.length
@@ -135,6 +140,17 @@ export function apply(ctx, config) {
       if (entry) totalBytes -= entry.bytes.length
     }
     return id
+  }
+
+  // 递归删除临时目录（try/finally 里清理 CLI 落盘产物，防 /tmp 无限增长）。
+  // 幂等：目录不存在也静默成功。
+  async function cleanupDir(dir) {
+    if (!dir) return
+    try {
+      await rm(dir, { recursive: true, force: true })
+    } catch {
+      // 清理失败不阻断主流程（尽力而为）
+    }
   }
 
   // ── 默认渠道/模型「账本」：settings 命名空间（热生效，跨会话持久）──
@@ -230,13 +246,14 @@ export function apply(ctx, config) {
   // ⚠️ 沙箱请求的 key 是 sandboxPolicy（不是 policy）：shell 服务的 resolve 只读
   // request.sandboxPolicy，传错 key 会被静默忽略并回退到部署级默认沙箱（受限
   // seatbelt）——codex/agy 的进程初始化（symlink/IPC socket）会因此 EPERM。
-  async function shellOnce(shell, cmd, timeoutMs) {
+  async function shellOnce(shell, cmd, timeoutMs, signal) {
     try {
       let spec
+      const base = { command: cmd, ...(timeoutMs ? { timeoutMs } : {}), ...(signal ? { signal } : {}) }
       try {
-        spec = shell.resolve({ command: cmd, ...(timeoutMs ? { timeoutMs } : {}), sandboxPolicy: { mode: 'danger-full-access' } })
+        spec = shell.resolve({ ...base, sandboxPolicy: { mode: 'danger-full-access' } })
       } catch {
-        spec = shell.resolve({ command: cmd, ...(timeoutMs ? { timeoutMs } : {}) })
+        spec = shell.resolve(base)
       }
       const run = await shell.run(spec)
       return { code: run.exitCode, out: (run.stdout?.text ?? '').trim(), err: (run.stderr?.text ?? '').trim() }
@@ -428,7 +445,16 @@ export function apply(ctx, config) {
     return out
   }
 
+  // API 渠道探测缓存：probeApiChannels 会对每个 provider 顺序 fetch /models
+  // （单个上限 10s），listBackends 在 set_image_default / generate_image 无默认
+  // gate 路径高频触发。CLI 探测已有进程级缓存，这里给慢的 API 探测加短 TTL。
+  const API_PROBE_TTL = 30_000
+  let apiProbeCache = { at: 0, value: null }
   async function probeApiChannels() {
+    const now = Date.now()
+    if (apiProbeCache.value && now - apiProbeCache.at < API_PROBE_TTL) {
+      return apiProbeCache.value
+    }
     const settings = ctx.get('settings')
     const credentials = ctx.get('credentials')
     if (!settings || !credentials) return []
@@ -474,6 +500,7 @@ export function apply(ctx, config) {
         out.push({ id, kind: 'api', name: id, baseURL, models })
       }
     }
+    apiProbeCache = { at: Date.now(), value: out }
     return out
   }
 
@@ -609,41 +636,49 @@ export function apply(ctx, config) {
         if (!shell) throw new Error('generate_image: shell service unavailable for the CLI backend')
         const dir = join(tmpdir(), `dsh-chat-imagine-${Date.now()}`)
         await mkdir(dir, { recursive: true })
-        const bin = channel.bin || config.mmxBin
-        // size -> mmx flags：比例（16:9）走 --aspect-ratio；像素（1024x1024）走 --width/--height
-        // （mmx 要求 512–2048 且为 8 的倍数，不满足则忽略，用 CLI 默认值）
-        const sizeRaw = String(args.size ?? '').trim()
-        let sizeFlags = ''
-        if (/^\d+:\d+$/.test(sizeRaw)) {
-          sizeFlags = ` --aspect-ratio ${JSON.stringify(sizeRaw)}`
-        } else {
-          const m = /^(\d+)x(\d+)$/.exec(sizeRaw)
-          const w = m ? Number(m[1]) : 0
-          const h = m ? Number(m[2]) : 0
-          if (w >= 512 && w <= 2048 && h >= 512 && h <= 2048 && w % 8 === 0 && h % 8 === 0) {
-            sizeFlags = ` --width ${w} --height ${h}`
-          }
-        }
-        const cmd = `${bin} image generate --prompt ${JSON.stringify(prompt)}${sizeFlags} --out-dir ${JSON.stringify(dir)} --non-interactive --quiet`
-        let spec
         try {
-          spec = shell.resolve({ command: cmd, timeoutMs: config.timeoutMs, sandboxPolicy: { mode: 'danger-full-access' } })
-        } catch {
-          spec = shell.resolve({ command: cmd, timeoutMs: config.timeoutMs })
+          const bin = channel.bin || config.mmxBin
+          // 单引号封装（与 codex/agy/vision 分支一致）：JSON.stringify 走双引号
+          // 上下文，$()/反引号会被 shell 命令替换（命令注入）——必须用 shq。
+          const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+          // size -> mmx flags：比例（16:9）走 --aspect-ratio；像素（1024x1024）走 --width/--height
+          // （mmx 要求 512–2048 且为 8 的倍数，不满足则忽略，用 CLI 默认值）
+          const sizeRaw = String(args.size ?? '').trim()
+          let sizeFlags = ''
+          if (/^\d+:\d+$/.test(sizeRaw)) {
+            sizeFlags = ` --aspect-ratio ${shq(sizeRaw)}`
+          } else {
+            const m = /^(\d+)x(\d+)$/.exec(sizeRaw)
+            const w = m ? Number(m[1]) : 0
+            const h = m ? Number(m[2]) : 0
+            if (w >= 512 && w <= 2048 && h >= 512 && h <= 2048 && w % 8 === 0 && h % 8 === 0) {
+              sizeFlags = ` --width ${w} --height ${h}`
+            }
+          }
+          const cmd = `${bin} image generate --prompt ${shq(prompt)}${sizeFlags} --out-dir ${shq(dir)} --non-interactive --quiet`
+          let spec
+          const req = { command: cmd, timeoutMs: config.timeoutMs, signal: exec.signal }
+          try {
+            spec = shell.resolve({ ...req, sandboxPolicy: { mode: 'danger-full-access' } })
+          } catch {
+            spec = shell.resolve(req)
+          }
+          const run = await shell.run(spec)
+          if (run.exitCode !== 0) {
+            throw new Error(`generate_image: mmx failed (exit ${run.exitCode}): ${(run.stderr?.text ?? '').slice(-500) || (run.stdout?.text ?? '').slice(-500)}`)
+          }
+          const files = await readdir(dir)
+          const file = files.find((f) => /\.(jpg|jpeg|png|webp|gif)$/i.test(f))
+          if (!file) throw new Error(`generate_image: mmx produced no image file. Output: ${(run.stdout?.text ?? '').slice(-500)}`)
+          const abs = join(dir, file)
+          const dot = abs.lastIndexOf('.')
+          const ext = (dot >= 0 ? abs.slice(dot) : '').toLowerCase()
+          const bytes = await readFile(abs)
+          const id = remember(bytes, MIME_BY_EXT[ext] ?? 'image/jpeg')
+          return `${markdownFor(id, '生成的图片')}\n\n（渠道 ${backend}，模型 ${model || file}。⚠️ 展示方式：必须把上面这行 markdown 图片引用【原样复制进你的回复文本】（保持 ![...](...) 格式，不要改成纯链接、不要另调 show_image_file/read_image、不要重新生成），图片才会内联显示在聊天中。）`
+        } finally {
+          await cleanupDir(dir)
         }
-        const run = await shell.run(spec)
-        if (run.exitCode !== 0) {
-          throw new Error(`generate_image: mmx failed (exit ${run.exitCode}): ${(run.stderr?.text ?? '').slice(-500) || (run.stdout?.text ?? '').slice(-500)}`)
-        }
-        const files = await readdir(dir)
-        const file = files.find((f) => /\.(jpg|jpeg|png|webp|gif)$/i.test(f))
-        if (!file) throw new Error(`generate_image: mmx produced no image file. Output: ${(run.stdout?.text ?? '').slice(-500)}`)
-        const abs = join(dir, file)
-        const dot = abs.lastIndexOf('.')
-        const ext = (dot >= 0 ? abs.slice(dot) : '').toLowerCase()
-        const bytes = await readFile(abs)
-        const id = remember(bytes, MIME_BY_EXT[ext] ?? 'image/jpeg')
-        return `${markdownFor(id, '生成的图片')}\n\n（渠道 ${backend}，模型 ${model || file}。⚠️ 展示方式：必须把上面这行 markdown 图片引用【原样复制进你的回复文本】（保持 ![...](...) 格式，不要改成纯链接、不要另调 show_image_file/read_image、不要重新生成），图片才会内联显示在聊天中。）`
       }
 
       // ── CLI 渠道（codex）─────────────────────────────────
@@ -671,7 +706,7 @@ export function apply(ctx, config) {
         // codex 跑的是完整 agent 循环（读提示→调工具→落盘），比单次 API 请求慢：
         // 至少给 5 分钟
         const cliTimeout = Math.max(config.timeoutMs, 300000)
-        const run = await shellOnce(shell, cmd, cliTimeout)
+        const run = await shellOnce(shell, cmd, cliTimeout, exec.signal)
         const output = `${run.out}\n${run.err}`
         // 路径解析：优先解析 codex 回复里报告的绝对路径（可能被反引号/括号包裹）；
         // 解析不到再按 mtime 扫描 generated_images 兜底。
@@ -719,54 +754,61 @@ export function apply(ctx, config) {
         }
         const shell = ctx.get('shell')
         if (!shell) throw new Error('generate_image: shell service unavailable for the CLI backend')
-        const bin = channel.bin || config.agyBin
-        const sizeRaw = String(args.size ?? '').trim()
-        let sizeHint = ''
-        if (/^\d+:\d+$/.test(sizeRaw)) sizeHint = `, aspect ratio ${sizeRaw}`
-        else if (/^\d+x\d+$/.test(sizeRaw)) sizeHint = `, roughly ${sizeRaw} pixels`
-        const startMs = Date.now()
-        const instr = `Use your built-in image generation tool (the Gemini image generation capability, NOT hand-written SVG or drawing code) to generate a PNG image: ${prompt}${sizeHint}. Then reply with the absolute file path of the saved PNG.`
-        const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
-        // 模型 id 白名单校验：它会直接拼进命令行（= 语法），只放行安全字符
-        const modelId = String(model || 'gemini-3.7-flash-low')
-        if (!/^[A-Za-z0-9._-]+$/.test(modelId)) {
-          throw new Error(`generate_image: invalid agy model id "${modelId}"`)
-        }
-        // agy 跑的是完整 agent 循环，至少给 5 分钟；在临时目录里跑，避免在
-        // 当前工作区留下会话文件。
-        // --dangerously-skip-permissions：agy 的内部 agent（jetski）在 headless
-        // 模式下无法弹权限询问，跑命令类工具会被自动拒绝（"a tool required the
-        // command permission that headless mode cannot prompt for"）；生图场景
-        // 没有需要人工确认的操作，直接放行。
-        const cmd = `cd "$(mktemp -d)" && ${bin} --print --output-format=stream-json --model=${modelId} --dangerously-skip-permissions --prompt=${shq(instr)}`
-        const cliTimeout = Math.max(config.timeoutMs, 300000)
-        const run = await shellOnce(shell, cmd, cliTimeout)
-        const output = `${run.out}\n${run.err}`
-        // 路径解析：优先解析回复里的绝对路径（antigravity-cli/brain/<uuid>/xx.png）；
-        // 解析不到再按 mtime 扫描 brain 目录兜底。
-        const re = /([^\s'"`（）()]*antigravity-cli\/brain\/[^\s'"`（）()]*\.(?:png|jpe?g|webp))/gi
-        const candidates = []
-        for (const m of output.matchAll(re)) {
-          try {
-            const st = await stat(m[1])
-            if (st.isFile()) candidates.push({ path: m[1], mtime: st.mtimeMs })
-          } catch {
-            // 输出里的路径不存在：跳过
+        // 在临时目录里跑，避免在用户工作区留下 agy 会话文件；目录由 JS 创建
+        // 并在 finally 里清理（不再用 shell 的 mktemp -d，否则路径不可追踪）。
+        const dir = join(tmpdir(), `dsh-chat-imagine-agy-${Date.now()}`)
+        await mkdir(dir, { recursive: true })
+        try {
+          const bin = channel.bin || config.agyBin
+          const sizeRaw = String(args.size ?? '').trim()
+          let sizeHint = ''
+          if (/^\d+:\d+$/.test(sizeRaw)) sizeHint = `, aspect ratio ${sizeRaw}`
+          else if (/^\d+x\d+$/.test(sizeRaw)) sizeHint = `, roughly ${sizeRaw} pixels`
+          const startMs = Date.now()
+          const instr = `Use your built-in image generation tool (the Gemini image generation capability, NOT hand-written SVG or drawing code) to generate a PNG image: ${prompt}${sizeHint}. Then reply with the absolute file path of the saved PNG.`
+          const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+          // 模型 id 白名单校验：它会直接拼进命令行（= 语法），只放行安全字符
+          const modelId = String(model || 'gemini-3.7-flash-low')
+          if (!/^[A-Za-z0-9._-]+$/.test(modelId)) {
+            throw new Error(`generate_image: invalid agy model id "${modelId}"`)
           }
+          // agy 跑的是完整 agent 循环，至少给 5 分钟。
+          // --dangerously-skip-permissions：agy 的内部 agent（jetski）在 headless
+          // 模式下无法弹权限询问，跑命令类工具会被自动拒绝（"a tool required the
+          // command permission that headless mode cannot prompt for"）；生图场景
+          // 没有需要人工确认的操作，直接放行。
+          const cmd = `cd ${shq(dir)} && ${bin} --print --output-format=stream-json --model=${modelId} --dangerously-skip-permissions --prompt=${shq(instr)}`
+          const cliTimeout = Math.max(config.timeoutMs, 300000)
+          const run = await shellOnce(shell, cmd, cliTimeout)
+          const output = `${run.out}\n${run.err}`
+          // 路径解析：优先解析回复里的绝对路径（antigravity-cli/brain/<uuid>/xx.png）；
+          // 解析不到再按 mtime 扫描 brain 目录兜底。
+          const re = /([^\s'"`（）()]*antigravity-cli\/brain\/[^\s'"`（）()]*\.(?:png|jpe?g|webp))/gi
+          const candidates = []
+          for (const m of output.matchAll(re)) {
+            try {
+              const st = await stat(m[1])
+              if (st.isFile()) candidates.push({ path: m[1], mtime: st.mtimeMs })
+            } catch {
+              // 输出里的路径不存在：跳过
+            }
+          }
+          if (candidates.length === 0) candidates.push(...await scanImagesSince(join(homedir(), '.gemini', 'antigravity-cli', 'brain'), startMs))
+          if (candidates.length === 0) {
+            const tail = output.trim().slice(-600) || '(无输出)'
+            const codeNote = run.code !== 0 ? ` (exit ${run.code})` : ''
+            throw new Error(`generate_image: agy 未产出图片${codeNote}。常见原因：未登录 Google 账号、额度用尽或出口区域被拒（User location is not supported，需换代理节点）——可让用户在 Antigravity App 里确认登录状态。输出尾部：${tail}\n手动恢复：加载技能 ${SKILL_NAME}，按其中 agy 渠道指引直接驱动 CLI 并用 show_image_file 展示。`)
+          }
+          candidates.sort((a, b) => b.mtime - a.mtime)
+          const abs = candidates[0].path
+          const dot = abs.lastIndexOf('.')
+          const ext = (dot >= 0 ? abs.slice(dot) : '').toLowerCase()
+          const bytes = await readFile(abs)
+          const id = remember(bytes, MIME_BY_EXT[ext] ?? 'image/png')
+          return `${markdownFor(id, '生成的图片')}\n\n（渠道 ${backend}，模型 ${modelId}——agy 内置 Gemini 图像工具，消耗 Google 账号额度。⚠️ 展示方式：必须把上面这行 markdown 图片引用【原样复制进你的回复文本】（保持 ![...](...) 格式，不要改成纯链接、不要另调 show_image_file/read_image、不要重新生成），图片才会内联显示在聊天中。）`
+        } finally {
+          await cleanupDir(dir)
         }
-        if (candidates.length === 0) candidates.push(...await scanImagesSince(join(homedir(), '.gemini', 'antigravity-cli', 'brain'), startMs))
-        if (candidates.length === 0) {
-          const tail = output.trim().slice(-600) || '(无输出)'
-          const codeNote = run.code !== 0 ? ` (exit ${run.code})` : ''
-          throw new Error(`generate_image: agy 未产出图片${codeNote}。常见原因：未登录 Google 账号、额度用尽或出口区域被拒（User location is not supported，需换代理节点）——可让用户在 Antigravity App 里确认登录状态。输出尾部：${tail}\n手动恢复：加载技能 ${SKILL_NAME}，按其中 agy 渠道指引直接驱动 CLI 并用 show_image_file 展示。`)
-        }
-        candidates.sort((a, b) => b.mtime - a.mtime)
-        const abs = candidates[0].path
-        const dot = abs.lastIndexOf('.')
-        const ext = (dot >= 0 ? abs.slice(dot) : '').toLowerCase()
-        const bytes = await readFile(abs)
-        const id = remember(bytes, MIME_BY_EXT[ext] ?? 'image/png')
-        return `${markdownFor(id, '生成的图片')}\n\n（渠道 ${backend}，模型 ${modelId}——agy 内置 Gemini 图像工具，消耗 Google 账号额度。⚠️ 展示方式：必须把上面这行 markdown 图片引用【原样复制进你的回复文本】（保持 ![...](...) 格式，不要改成纯链接、不要另调 show_image_file/read_image、不要重新生成），图片才会内联显示在聊天中。）`
       }
 
       // ── API 渠道 ────────────────────────────────────────
@@ -832,7 +874,9 @@ export function apply(ctx, config) {
         const img = await fetch(item.url, { signal: AbortSignal.any([exec.signal, AbortSignal.timeout(config.timeoutMs)]) })
         if (!img.ok) throw new Error(`generate_image: failed to download image from gateway url (${img.status})`)
         const ct = img.headers.get('content-type')?.split(';')[0] ?? ''
-        if (/^image\//.test(ct)) mime = ct
+        // 只放行栅格图 MIME：image/svg+xml 可内嵌 <script>，直接透传给浏览器
+        // 会造成 XSS 面（web 路由按此 MIME 返回）。非白名单一律退回 image/png。
+        if (/^image\/(png|jpe?g|webp|gif)$/.test(ct)) mime = ct
         bytes = Buffer.from(await img.arrayBuffer())
       }
       if (!bytes) throw new Error('generate_image: gateway response has neither b64_json nor url')
@@ -906,11 +950,20 @@ export function apply(ctx, config) {
       // 渠道选择：显式 > 账本默认（visionBackend）> 探测序（mmx 最快）
       const explicit = String(args.backend ?? '').trim()
       let backend = explicit
+      let fromLedger = false
       if (!backend) {
         try {
           const v = ctx.get('settings')?.get('dsh-chat-imagine')
           backend = typeof v?.visionBackend === 'string' ? v.visionBackend : ''
+          fromLedger = backend !== ''
         } catch {}
+      }
+      if (fromLedger) {
+        // 账本渠道未必仍安装（CLI 被卸载 / 换机器）：校验探测结果，不可用就
+        // 回退到探测序自动选，而不是硬报「CLI not found」。显式渠道不在此列
+        // （模型点名它，出错就该报错让调用方知道）。
+        const ledgerChannel = await (backend === 'mmx' ? mmxChannel() : backend === 'codex' ? codexChannel() : backend === 'agy' ? agyChannel() : null)
+        if (!ledgerChannel) backend = ''
       }
       if (!backend) {
         const [mmx, codex, agy] = await Promise.all([mmxChannel(), codexChannel(), agyChannel()])
@@ -939,7 +992,7 @@ export function apply(ctx, config) {
         const cmd =
           bin + ' vision describe --image ' + shq(path) +
           ' --prompt ' + shq(question) + ' --output json --non-interactive --quiet'
-        const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 120000))
+        const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 120000), exec.signal)
         if (run.code !== 0) {
           throw new Error('analyze_image: mmx failed (exit ' + run.code + '): ' + (run.err || run.out).slice(-500))
         }
@@ -973,41 +1026,45 @@ export function apply(ctx, config) {
         // modlens isolateWorkdir 同款思路）
         const dir = join(tmpdir(), 'dsh-chat-imagine-vision-' + Date.now())
         await mkdir(dir, { recursive: true })
-        const schemaFile = join(dir, 'schema.json')
-        await writeFile(schemaFile, JSON.stringify(strictSchema(VISION_SCHEMA)))
-        let imgArg = path
-        if (!isUrl) {
-          const extMatch = path.match(/\.[a-z0-9]+$/i)
-          const ext = extMatch ? extMatch[0].toLowerCase() : '.png'
-          const copyPath = join(dir, 'image' + ext)
-          await writeFile(copyPath, await readFile(path))
-          imgArg = copyPath
+        try {
+          const schemaFile = join(dir, 'schema.json')
+          await writeFile(schemaFile, JSON.stringify(strictSchema(VISION_SCHEMA)))
+          let imgArg = path
+          if (!isUrl) {
+            const extMatch = path.match(/\.[a-z0-9]+$/i)
+            const ext = extMatch ? extMatch[0].toLowerCase() : '.png'
+            const copyPath = join(dir, 'image' + ext)
+            await writeFile(copyPath, await readFile(path))
+            imgArg = copyPath
+          }
+          const cmd =
+            bin + ' exec --skip-git-repo-check --ephemeral -s read-only' +
+            ' -c ' + JSON.stringify('model_reasoning_effort="low"') +
+            ' -i ' + shq(imgArg) +
+            ' --output-schema ' + shq(schemaFile) + ' ' +
+            shq(prompt) +
+            ' < /dev/null'
+          // ↑ 经 shell 服务运行时 stdin 是打开的管道，codex 会打印
+          // "Reading additional input from stdin..." 然后阻塞等待输入直到
+          // 超时（终端手跑没事因为 stdin 是关闭的）。重定向 /dev/null 让它
+          // 立即读到 EOF——实测修复。
+          const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 240000), exec.signal)
+          if (run.code !== 0) {
+            throw new Error(
+              'analyze_image: codex failed (exit ' + run.code + ')' +
+                (run.code === -1 ? '，疑似超时（完整 schema 输出较慢，可重试或换 backend "mmx" / "agy"）' : '') +
+                ': ' + (run.err || run.out).slice(-300),
+            )
+          }
+          const output = run.out + '\n' + run.err
+          // codex 的 stdout 是整个会话记录（会话头、schema 校验失败的半截
+          // JSON、模型自我重试旁白都可能混在里面）。组装器的平衡括号扫描
+          // 会跳过损坏段，找到真正可解析的最终对象；都找不到则兜底降级。
+          const result = assembleVisionResult(output, 'codex')
+          return { ...result, _meta: { channel: 'codex', model: 'gpt-5.x (codex)', durationSeconds: ((Date.now() - startedAt) / 1000).toFixed(1) } }
+        } finally {
+          await cleanupDir(dir)
         }
-        const cmd =
-          bin + ' exec --skip-git-repo-check --ephemeral -s read-only' +
-          ' -c ' + JSON.stringify('model_reasoning_effort="low"') +
-          ' -i ' + shq(imgArg) +
-          ' --output-schema ' + shq(schemaFile) + ' ' +
-          shq(prompt) +
-          ' < /dev/null'
-        // ↑ 经 shell 服务运行时 stdin 是打开的管道，codex 会打印
-        // "Reading additional input from stdin..." 然后阻塞等待输入直到
-        // 超时（终端手跑没事因为 stdin 是关闭的）。重定向 /dev/null 让它
-        // 立即读到 EOF——实测修复。
-        const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 240000))
-        if (run.code !== 0) {
-          throw new Error(
-            'analyze_image: codex failed (exit ' + run.code + ')' +
-              (run.code === -1 ? '，疑似超时（完整 schema 输出较慢，可重试或换 backend "mmx" / "agy"）' : '') +
-              ': ' + (run.err || run.out).slice(-300),
-          )
-        }
-        const output = run.out + '\n' + run.err
-        // codex 的 stdout 是整个会话记录（会话头、schema 校验失败的半截
-        // JSON、模型自我重试旁白都可能混在里面）。组装器的平衡括号扫描
-        // 会跳过损坏段，找到真正可解析的最终对象；都找不到则兜底降级。
-        const result = assembleVisionResult(output, 'codex')
-        return { ...result, _meta: { channel: 'codex', model: 'gpt-5.x (codex)', durationSeconds: ((Date.now() - startedAt) / 1000).toFixed(1) } }
       }
 
       // ── agy：--print + --json-schema（envelope.structured_output）────
@@ -1019,55 +1076,59 @@ export function apply(ctx, config) {
         const bin = channel.bin || config.agyBin
         const dir = join(tmpdir(), 'dsh-chat-imagine-vision-' + Date.now())
         await mkdir(dir, { recursive: true })
-        const schemaFile = join(dir, 'schema.json')
-        // agy 对 schema 无 strict 要求，直接用原生 VISION_SCHEMA
-        await writeFile(schemaFile, JSON.stringify(VISION_SCHEMA))
-        // agy 的 flag 解析有两个实测坑：① 必须 --key value 空格分隔（=value 会
-        // 碎片化）；② prompt 必须放在第一个 flag 位置（-p 紧跟二进制名）——
-        // 放后面时其它 flag 会被误吞进 prompt 文本，输出变成闲聊而非 JSON。
-        // 图片让 agent 读绝对路径（prompt 里已带）。在隔离目录里跑（防注入）。
-        const cmd =
-          'cd ' + shq(dir) + ' && ' + bin +
-          ' -p ' + shq(prompt) +
-          ' --dangerously-skip-permissions --output-format json --json-schema ' + shq(schemaFile) +
-          ' --model gemini-3.7-flash-low --print-timeout 120s'
-        const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 180000))
-        if (run.code !== 0 && !run.out.trim()) {
-          throw new Error('analyze_image: agy failed (exit ' + run.code + '): ' + (run.err || run.out).slice(-500))
-        }
-        let envelope
         try {
-          envelope = JSON.parse(run.out)
-        } catch {
-          envelope = null
-        }
-        if (envelope?.status && envelope.status !== 'SUCCESS') {
-          // agy 对 auth/quota 一律 exit 1 + "Agent execution terminated due to error"，
-          // 真实原因在其日志里（modlens 的经验）。给用户可操作的指引。
-          throw new Error(
-            'analyze_image: agy reported status ' + envelope.status +
-              ' ("' + String(envelope.error ?? '').slice(0, 120) + '").' +
-              ' Common causes: Google 账号额度用尽（agy 免费档是周桶，桌面 App/CLI/SDK 共享，重试或换渠道）、未登录、或区域限制。' +
-              ' 可换 backend "mmx" 或 "codex" 重试，或在终端跑一次 agy 看具体报错。',
+          const schemaFile = join(dir, 'schema.json')
+          // agy 对 schema 无 strict 要求，直接用原生 VISION_SCHEMA
+          await writeFile(schemaFile, JSON.stringify(VISION_SCHEMA))
+          // agy 的 flag 解析有两个实测坑：① 必须 --key value 空格分隔（=value 会
+          // 碎片化）；② prompt 必须放在第一个 flag 位置（-p 紧跟二进制名）——
+          // 放后面时其它 flag 会被误吞进 prompt 文本，输出变成闲聊而非 JSON。
+          // 图片让 agent 读绝对路径（prompt 里已带）。在隔离目录里跑（防注入）。
+          const cmd =
+            'cd ' + shq(dir) + ' && ' + bin +
+            ' -p ' + shq(prompt) +
+            ' --dangerously-skip-permissions --output-format json --json-schema ' + shq(schemaFile) +
+            ' --model gemini-3.7-flash-low --print-timeout 120s'
+          const run = await shellOnce(shell, cmd, Math.max(config.timeoutMs, 180000), exec.signal)
+          if (run.code !== 0 && !run.out.trim()) {
+            throw new Error('analyze_image: agy failed (exit ' + run.code + '): ' + (run.err || run.out).slice(-500))
+          }
+          let envelope
+          try {
+            envelope = JSON.parse(run.out)
+          } catch {
+            envelope = null
+          }
+          if (envelope?.status && envelope.status !== 'SUCCESS') {
+            // agy 对 auth/quota 一律 exit 1 + "Agent execution terminated due to error"，
+            // 真实原因在其日志里（modlens 的经验）。给用户可操作的指引。
+            throw new Error(
+              'analyze_image: agy reported status ' + envelope.status +
+                ' ("' + String(envelope.error ?? '').slice(0, 120) + '").' +
+                ' Common causes: Google 账号额度用尽（agy 免费档是周桶，桌面 App/CLI/SDK 共享，重试或换渠道）、未登录、或区域限制。' +
+                ' 可换 backend "mmx" 或 "codex" 重试，或在终端跑一次 agy 看具体报错。',
+            )
+          }
+          // agy 的 structured_output 已是对象；response 是自由文本（可能含
+          // JSON），两者都交给组装器统一处理（对象走字段级修复路径）。
+          const rawResult = envelope?.structured_output ?? envelope?.response ?? ''
+          const result = assembleVisionResult(
+            typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult),
+            'agy',
           )
-        }
-        // agy 的 structured_output 已是对象；response 是自由文本（可能含
-        // JSON），两者都交给组装器统一处理（对象走字段级修复路径）。
-        const rawResult = envelope?.structured_output ?? envelope?.response ?? ''
-        const result = assembleVisionResult(
-          typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult),
-          'agy',
-        )
-        if (!result) {
-          throw new Error('analyze_image: agy returned no usable content: ' + (run.out || run.err).slice(0, 300))
-        }
-        return {
-          ...result,
-          _meta: {
-            channel: 'agy',
-            model: 'gemini-3.7-flash-low',
+          if (!result) {
+            throw new Error('analyze_image: agy returned no usable content: ' + (run.out || run.err).slice(0, 300))
+          }
+          return {
+            ...result,
+            _meta: {
+              channel: 'agy',
+              model: 'gemini-3.7-flash-low',
             durationSeconds: envelope?.duration_seconds ?? ((Date.now() - startedAt) / 1000).toFixed(1),
           },
+          }
+        } finally {
+          await cleanupDir(dir)
         }
       }
 
