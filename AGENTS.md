@@ -8,17 +8,21 @@ Guidance for coding agents working in this repository.
 
 ## Repo layout
 
-- `index.js` — the entire plugin (ESM, plain JavaScript, ~530 lines). No build step, no TypeScript, no bundler. Do not add any.
+- `index.js` — the entire plugin (ESM, plain JavaScript, ~1180 lines). No build step, no TypeScript, no bundler. Do not add any.
+- `vision.js` — the shared image-recognition evidence contract (VISION_SCHEMA) and pure helpers (strictSchema/extractJson/schemaViolations/assembleVisionResult/…).
+- `vision.test.js` — zero-dependency unit tests for `vision.js` (`node:test`); not published (excluded from `package.json` `files`).
 - `cordis.patch.yml` — bundle layer that registers the plugin into the harness composition when installed via `dsh plugin add`.
 - `README.md` (中文) / `README.en.md` (English) — user docs; keep both in sync when behavior changes. They embed screenshots from `assets/`.
-- `package.json` — `files` controls what npm publishes (`index.js`, patch yml, assets, both READMEs). Peer deps (`@deepseek-ai/dsh-tools`, `@deepseek-ai/schemastery`) are provided by the DSH host at runtime; `node_modules` exists only for local editor/link support and is gitignored.
+- `package.json` — `files` controls what npm publishes (`index.js`, `vision.js`, patch yml, assets, both READMEs). Peer deps (`@deepseek-ai/dsh-tools`, `@deepseek-ai/schemastery`) are provided by the DSH host at runtime; `node_modules` exists only for local editor/link support and is gitignored.
 
 ## Commands
 
-There is no build/test/lint pipeline. To validate changes:
+There is no build/lint pipeline. To validate changes:
 
 ```sh
 node --check index.js            # syntax check
+node --test vision.test.js       # vision.js pure-function unit tests (node:test)
+bash skills/cli-image-gen/scripts/test-gen.sh   # gen.sh stub tests (no real quota)
 dsh plugin --profile web add /abs/path/to/this/repo   # install locally into DSH for a real test
 ```
 
@@ -28,12 +32,13 @@ Real verification means installing the plugin and exercising the tools in a fres
 
 Plugin shape: `export const name`, `export const inject = ['tools', 'webServer']` (hard deps), `export const Config` (schemastery), `export function apply(ctx, config)`.
 
-Registers 4 tools via `ctx.tools.register(defineTool(...))`:
+Registers 5 tools via `ctx.tools.register(defineTool(...))`:
 
 1. `list_image_backends` — probes all channels; render function is a pure `renderBackendReport()`.
 2. `generate_image` — the core. **HARD GATE**: refuses to generate (returns a guidance report instead) until a default backend exists, even when `backend` is passed explicitly. Only exception flow: user names a channel → `set_image_default` persists it → retry. The agent must never pick a channel on the user's behalf; empty channel lists get the "how to configure" guidance instead of a dead-end question loop.
 3. `show_image_file` — serves an on-disk image inline.
 4. `set_image_default` — persists default backend/model.
+5. `analyze_image` — reads an image (local path or http(s) URL) into structured JSON evidence via the mmx/codex/agy CLI vision channels; any model can call it without vision-model switching.
 
 Services: `tools`/`webServer` are injected; `shell`, `settings`, `credentials` are fetched lazily via `ctx.get(...)` at call time (they may not exist yet during `apply`) — keep that pattern.
 
